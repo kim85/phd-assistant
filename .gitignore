@@ -1,0 +1,19 @@
+.streamlit/secrets.toml
+.streamlit/config.toml
+
+2. Python Environment & Cache (Too big to upload)
+
+env/
+venv/
+pycache/
+*.pyc
+
+3. App Data (Keep your history local)
+
+experiment_history.json
+knowledge_base.json
+*.png
+
+4. OS files
+
+.DS_Store
