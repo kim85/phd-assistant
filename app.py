@@ -19,8 +19,7 @@ st.title("PhD Assistant: Experiment Designer 🧪")
 with st.sidebar:
     st.header("⚙️ Configuration")
     
-    # A. API KEY
-    # BYOK: Users must input their own key.
+    # A. API KEY (Bring Your Own Key)
     api_key = st.text_input("1. Enter Google API Key", type="password")
     
     # B. DYNAMIC MODEL SELECTOR
@@ -28,68 +27,37 @@ with st.sidebar:
     if api_key:
         try:
             genai.configure(api_key=api_key)
-            
-            # Fetch valid models for this key
-            model_list = []
-            for m in genai.list_models():
-                if 'generateContent' in m.supported_generation_methods:
-                    model_list.append(m.name)
-            
+            model_list = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
             if model_list:
                 st.success(f"Key Valid! Found {len(model_list)} models.")
                 selected_model_name = st.selectbox("2. Select AI Model", model_list, index=0)
             else:
-                st.error("Key valid, but no models found. Check Google AI Studio permissions.")
-                
+                st.error("Key valid, but no models found.")
         except Exception as e:
             st.error(f"API Key Error: {e}")
 
     st.divider()
     
-    # --- C. KNOWLEDGE BASE (THE BRAIN) ---
-    st.header("🧠 Knowledge Base")
-    st.info("The model learns from your corrections here.")
-    
-    KB_FILE = "knowledge_base.json"
-    
-    # Load KB
-    if "knowledge_base" not in st.session_state:
-        if os.path.exists(KB_FILE):
-            with open(KB_FILE, "r") as f:
-                st.session_state.knowledge_base = json.load(f)
-        else:
-            st.session_state.knowledge_base = []
-
-    # Display Rules
-    if st.session_state.knowledge_base:
-        with st.expander("View Learned Rules", expanded=False):
-            for i, rule in enumerate(st.session_state.knowledge_base):
-                col_rule, col_del = st.columns([4, 1])
-                col_rule.write(f"{i+1}. {rule}")
-                if col_del.button("❌", key=f"del_{i}"):
-                    st.session_state.knowledge_base.pop(i)
-                    with open(KB_FILE, "w") as f:
-                        json.dump(st.session_state.knowledge_base, f)
-                    st.rerun()
-    else:
-        st.caption("No rules learned yet.")
-
-    st.divider()
-    
-    # --- D. CASE MANAGEMENT ---
+    # --- C. CASE MANAGEMENT ---
     st.header("💾 Case Management")
     HISTORY_FILE = "experiment_history.json"
     
+    # Load History
     if "history" not in st.session_state:
         if os.path.exists(HISTORY_FILE):
             try:
-                with open(HISTORY_FILE, "r") as f: st.session_state.history = json.load(f)
-            except: st.session_state.history = {}
-        else: st.session_state.history = {}
+                with open(HISTORY_FILE, "r") as f:
+                    st.session_state.history = json.load(f)
+            except:
+                st.session_state.history = {}
+        else:
+            st.session_state.history = {}
     
-    if "current_case_name" not in st.session_state: st.session_state.current_case_name = None
+    if "current_case_name" not in st.session_state:
+        st.session_state.current_case_name = None
 
-    save_name = st.text_input("Case Name", placeholder="e.g. Matrix Test 1", label_visibility="collapsed")
+    # 1. Create New Case
+    save_name = st.text_input("New Case Name", placeholder="e.g. Test 1", label_visibility="collapsed")
     if st.button("💾 Create New Case"):
         if save_name:
             st.session_state.history[save_name] = {"extracted_text": "", "active_code": ""}
@@ -98,21 +66,23 @@ with st.sidebar:
             st.success(f"Created '{save_name}'!")
             st.rerun()
 
+    # 2. Update/Save Current Case
     if st.session_state.current_case_name:
         st.divider()
-        st.subheader(f"Editing: {st.session_state.current_case_name}")
-        if st.button("💾 Update/Save Changes", type="primary"):
+        st.info(f"Editing: **{st.session_state.current_case_name}**")
+        if st.button("💾 Save Changes to Case", type="primary"):
             st.session_state.history[st.session_state.current_case_name] = {
                 "extracted_text": st.session_state.get("extracted_text", ""),
                 "active_code": st.session_state.get("active_code", "")
             }
             with open(HISTORY_FILE, "w") as f: json.dump(st.session_state.history, f)
-            st.toast(f"Saved extracted text & code to '{st.session_state.current_case_name}'!")
+            st.toast(f"Saved to '{st.session_state.current_case_name}'!")
 
+    # 3. Load Existing Case
     if st.session_state.history:
         st.divider()
-        load_name = st.selectbox("Select Case", list(st.session_state.history.keys()), label_visibility="collapsed")
-        if st.button("📂 Load Case"):
+        load_name = st.selectbox("Select Case to Load", list(st.session_state.history.keys()))
+        if st.button("📂 Load Selected Case"):
             data = st.session_state.history[load_name]
             st.session_state.extracted_text = data.get("extracted_text", "")
             st.session_state.active_code = data.get("active_code", "")
@@ -121,6 +91,16 @@ with st.sidebar:
             st.session_state.run_output = None
             st.success(f"Loaded '{load_name}'!")
             st.rerun()
+            
+        # Download Button (Backup)
+        if os.path.exists(HISTORY_FILE):
+            with open(HISTORY_FILE, "rb") as f:
+                st.download_button(
+                    label="📥 Download History (Backup)",
+                    data=f,
+                    file_name="experiment_history.json",
+                    mime="application/json"
+                )
 
     st.divider()
     st.header("📂 Input")
@@ -183,21 +163,6 @@ def fix_code_ai(bad_code, error, model_name):
     resp = generate_with_retry(model, prompt)
     return extract_code(resp.text)
 
-def learn_from_fix(original_error, fixed_code, model_name):
-    """Analyzes a fix and extracts a generic rule."""
-    model = genai.GenerativeModel(model_name)
-    prompt = f"""
-    You are a Teacher. 
-    A student encountered this error: "{original_error}"
-    They fixed it with this code:
-    {fixed_code}
-    
-    Extract ONE short, generic rule (1 sentence) to prevent this mistake in the future.
-    Example: "Always use cp.Variable((n,1)) for vectors."
-    """
-    resp = generate_with_retry(model, prompt)
-    return resp.text.strip()
-
 # --- 5. MAIN LOGIC ---
 
 if st.session_state.current_case_name:
@@ -220,30 +185,24 @@ if uploaded_file and ("last_file" not in st.session_state or st.session_state.la
 # Step B: Workflow
 if (uploaded_file or st.session_state.show_review) and selected_model_name:
     
-    # 1. ANALYZE BUTTON (Requires file)
+    # 1. ANALYZE
     if uploaded_file and not st.session_state.show_review:
-        st.info("Step 1: Extract text and formulas from the PDF.")
+        st.info("Step 1: Extract text and formulas.")
         if st.button("🔍 Analyze & Extract Text", type="primary"):
             with st.spinner(f"Analyzing with {selected_model_name}..."):
                 try:
                     model = genai.GenerativeModel(selected_model_name)
-                    # Ask specifically for text description first
                     inputs = ["Analyze this PDF. Provide a detailed summary in Russian, explicitly listing all matrices (A, b, etc.) and the objective function. Do NOT write code yet."] + st.session_state.pdf_images
-                    
                     response = generate_with_retry(model, inputs)
                     st.session_state.extracted_text = response.text
                     st.session_state.show_review = True
                     st.rerun()
                 except Exception as e: st.error(f"Analysis failed: {e}")
 
-    # 2. REVIEW & EDIT SECTION
+    # 2. REVIEW & GENERATE
     if st.session_state.show_review:
-        st.success("Step 1 Complete. Review or Edit the problem description below.")
-        
-        # Capture the current live text from the widget
-        live_problem_description = st.text_area("📝 Edit Experiment Details (Correct any math typos here):", 
-                     key="extracted_text", # Binds directly to st.session_state.extracted_text
-                     height=300)
+        st.success("Step 1 Complete. Review below.")
+        live_problem_description = st.text_area("📝 Edit Experiment Details:", key="extracted_text", height=300)
         
         col1, col2 = st.columns([1, 4])
         with col1:
@@ -252,34 +211,21 @@ if (uploaded_file or st.session_state.show_review) and selected_model_name:
                  st.session_state.extracted_text = ""
                  st.rerun()
         with col2:
-            # 3. GENERATE CODE BUTTON
             if st.button("🚀 Generate Python Code (Step 2)", type="primary"):
-                
-                with st.spinner("Generating Code from your corrected text..."):
+                with st.spinner("Generating Code..."):
                     try:
                         model = genai.GenerativeModel(selected_model_name)
                         
-                        # PREPARE LEARNED RULES
-                        learned_rules_str = ""
-                        if st.session_state.knowledge_base:
-                            learned_rules_str = "USER-DEFINED KNOWLEDGE BASE (STRICTLY FOLLOW THESE RULES):\n" + "\n".join([f"- {r}" for r in st.session_state.knowledge_base])
-
-                        # IMPROVED: Empty Template to prevent hallucinations
                         CVXPY_TEMPLATE = """
                         import cvxpy as cp
                         import numpy as np
                         import matplotlib.pyplot as plt
                         
-                        # 1. INPUT DATA 
-                        # !!! CRITICAL: POPULATE THIS SECTION ONLY WITH DATA FROM THE DESCRIPTION !!!
-                        # Do NOT use random numbers. Do NOT use identity matrices unless specified.
-                        
-                        # Example of extraction (Replace with ACTUAL data):
+                        # 1. INPUT DATA (Load from description ONLY)
                         # n = ...
                         # A = np.array(...) 
                         
                         # 2. VARIABLES
-                        # Use (n, 1) for column vectors
                         # x = cp.Variable((n, 1)) 
                         
                         # 3. CONSTRAINTS
@@ -287,26 +233,16 @@ if (uploaded_file or st.session_state.show_review) and selected_model_name:
                         
                         # 4. SOLVE
                         # prob = cp.Problem(cp.Minimize(0), constraints)
-                        # try:
-                        #     prob.solve(solver=cp.SCS)
-                        # except:
-                        #     prob.solve()
-                            
-                        # 5. OUTPUT
-                        # if prob.status in ["optimal", "optimal_inaccurate"]:
-                        #     print("Result found.")
-                        #     plt.close()
+                        # prob.solve(solver=cp.SCS)
                         """
 
                         prompt = f"""
-                        You are a strict coder. Implement the experiment EXACTLY as described in the DESCRIPTION.
+                        You are a strict coder. Implement the experiment EXACTLY as described.
                         
                         REFERENCE TEMPLATE (Structure Only - DO NOT COPY VALUES):
                         {CVXPY_TEMPLATE}
 
-                        {learned_rules_str}
-
-                        DESCRIPTION (SOURCE OF TRUTH - FOLLOW STRICTLY):
+                        DESCRIPTION (SOURCE OF TRUTH):
                         {live_problem_description}
                         
                         STANDARD RULES:
@@ -321,13 +257,9 @@ if (uploaded_file or st.session_state.show_review) and selected_model_name:
                            - NEVER use variable name `lambda` (reserved). Use `lam`.
                            - Always check `if prob.status in ["optimal", ...]` before accessing .value
                            - Use `plt.close()` after saving plots.
-                        7. DATA INTEGRITY (ZERO TOLERANCE):
-                           - You are a TRANSLATOR, not a designer.
-                           - Translate the math in the DESCRIPTION to Python code 1:1.
-                           - If the description defines A as [[1, 3], [2, 4]], your code MUST have A = np.array([[1, 3], [2, 4]]).
+                        7. DATA INTEGRITY:
+                           - ONLY define matrices (A, b, F, etc.) that are explicitly listed in the DESCRIPTION.
                            - Do NOT invent new parameters (like rho, alpha) unless they are in the text.
-                           - Do NOT assume matrices are Identity or Zero unless explicitly stated.
-                           - If a value is missing, insert a comment: # ERROR: MISSING VALUE FOR [VARIABLE]
                         """
                         response = generate_with_retry(model, prompt)
                         st.session_state.messages.append({"role": "assistant", "content": response.text})
@@ -366,31 +298,12 @@ if st.session_state.active_code:
         with t3:
             if res['err']:
                 st.error(res['err'])
-                
-                col_fix, col_learn = st.columns(2)
-                with col_fix:
-                    if st.button("🚑 Fix This Error"):
-                        with st.spinner("Fixing..."):
-                            fixed = fix_code_ai(edited_code, res['err'], selected_model_name)
-                            if fixed:
-                                st.session_state.active_code = fixed
-                                st.session_state.run_output = None
-                                st.success("Fixed!")
-                                st.rerun()
-                
-                # LEARNING BUTTON
-                with col_learn:
-                    # We can only learn if we have a successful fix. 
-                    # But often we want to learn from the ERROR itself to avoid it next time.
-                    # Let's allow learning from the error context.
-                    if st.button("🧠 Learn from this Error"):
-                        with st.spinner("Analyzing error to create a rule..."):
-                            rule = learn_from_fix(res['err'], edited_code, selected_model_name)
-                            if rule:
-                                st.session_state.knowledge_base.append(rule)
-                                with open("knowledge_base.json", "w") as f:
-                                    json.dump(st.session_state.knowledge_base, f)
-                                st.success(f"Learned Rule: {rule}")
-                                time.sleep(2)
-                                st.rerun()
+                if st.button("🚑 Fix This Error"):
+                    with st.spinner("Fixing..."):
+                        fixed = fix_code_ai(edited_code, res['err'], selected_model_name)
+                        if fixed:
+                            st.session_state.active_code = fixed
+                            st.session_state.run_output = None
+                            st.success("Fixed!")
+                            st.rerun()
             else: st.success("No errors.")
