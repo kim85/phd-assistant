@@ -3,6 +3,7 @@ pymupdf
 google-generativeai
 Pillow
 cvxpy
-numpy
+numpy<2
 matplotlib
-scipypython-docx
+scipy
+python-docx
