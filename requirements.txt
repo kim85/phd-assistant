@@ -2,7 +2,7 @@ streamlit
 pymupdf
 google-generativeai
 Pillow
-cvxpy
+cvxpy==1.4.2
 numpy<2
 matplotlib
 scipy
