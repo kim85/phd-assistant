@@ -31,39 +31,21 @@ with st.sidebar:
     # A. API KEY (Bring Your Own Key)
     api_key = st.text_input("1. Enter Google API Key", type="password")
     
-    # B. DYNAMIC MODEL SELECTOR
+    # B. STRICT MODEL SELECTION
     selected_model_name = None
     if api_key:
         try:
             genai.configure(api_key=api_key)
-            all_models = genai.list_models()
-            model_list = []
-            for m in all_models:
-                if 'generateContent' in m.supported_generation_methods:
-                    name = m.name.lower()
-                    if any(ver in name for ver in ['1.5', '2.0', '2.5', '3.0', 'vision', 'lite']):
-                        model_list.append(m.name)
+            # Verify key validity by making a lightweight call
+            # We don't need the full list since we are forcing one model
+            list(genai.list_models()) 
             
-            model_list.sort(reverse=True)
-
-            # --- USER PREFERENCE OVERRIDE ---
-            # Explicitly force the requested model to the top of the list
-            # so it is selected by default.
-            preferred_model = "models/gemini-2.5-flash-lite"
-            if preferred_model not in model_list:
-                model_list.insert(0, preferred_model)
-            # --------------------------------
-
-            # Manual Override Option
-            use_manual = st.checkbox("Enter Model Name Manually")
+            st.success("Key Valid!")
             
-            if use_manual:
-                selected_model_name = st.text_input("Model Name", value=preferred_model)
-            elif model_list:
-                st.success(f"Key Valid! Found models.")
-                selected_model_name = st.selectbox("2. Select AI Model", model_list, index=0)
-            else:
-                st.error("Key valid, but no Vision models found.")
+            # STRICT LIMIT: Force only this model
+            selected_model_name = "models/gemini-2.5-flash-lite"
+            st.info(f"🔒 Using required model:\n**{selected_model_name}**")
+            
         except Exception as e:
             st.error(f"API Key Error: {e}")
 
@@ -111,6 +93,7 @@ with st.sidebar:
     save_name = st.text_input("New Case Name", placeholder="e.g. Test 1", label_visibility="collapsed")
     if st.button("💾 Create New Case"):
         if save_name:
+            # Capture current state to preserve work if valid
             st.session_state.history[save_name] = {
                 "extracted_text": st.session_state.get("extracted_text", ""),
                 "active_code": st.session_state.get("active_code", ""),
@@ -125,8 +108,8 @@ with st.sidebar:
     if st.session_state.current_case_name:
         st.divider()
         st.info(f"Editing: **{st.session_state.current_case_name}**")
-        if st.button("💾 Update/Save Changes", type="primary"):
-            # Serialize run output
+        if st.button("💾 Save All (Code + Output)", type="primary"):
+            # Serialize run output (including plots as base64)
             serializable_output = None
             if st.session_state.run_output:
                 serializable_output = {
@@ -141,7 +124,7 @@ with st.sidebar:
                 "run_output": serializable_output
             }
             with open(HISTORY_FILE, "w") as f: json.dump(st.session_state.history, f)
-            st.toast(f"Saved extracted text & code to '{st.session_state.current_case_name}'!")
+            st.toast(f"Saved '{st.session_state.current_case_name}' with outputs!")
 
     # Load Case
     if st.session_state.history:
@@ -152,12 +135,13 @@ with st.sidebar:
             st.session_state.extracted_text = data.get("extracted_text", "")
             st.session_state.active_code = data.get("active_code", "")
             
+            # Deserialize outputs
             run_data = data.get("run_output")
             if run_data:
                 st.session_state.run_output = {
-                    "out": run_data.get("out", ""),
-                    "err": run_data.get("err", ""),
-                    "plots": [base64.b64decode(p) for p in run_data.get("plots", [])]
+                    "out": run_data["out"],
+                    "err": run_data["err"],
+                    "plots": [base64.b64decode(p) for p in run_data["plots"]]
                 }
             else:
                 st.session_state.run_output = None
@@ -201,7 +185,7 @@ def generate_with_retry(model, inputs, retries=3):
             time.sleep(1)
 
 def run_code_backend(code):
-    try: import cvxpy, matplotlib
+    try: import cvxpy, matplotlib, docx
     except ImportError as e: return "", f"Missing library {e.name}. Install it.", []
 
     is_safe, msg = validate_code_safety(code)
@@ -217,12 +201,13 @@ def run_code_backend(code):
     for f in glob.glob("*.png"):
         try:
             with open(f, "rb") as img: plots.append(img.read())
-            # os.remove(f) # Keep files momentarily for report generation
+            # os.remove(f) # Keep files momentarily for PDF generation if needed
         except: pass
     return proc.stdout, proc.stderr, plots
 
 def fix_code_ai(bad_code, error, model_name, problem_desc):
     model = genai.GenerativeModel(model_name)
+    # RAG: Inject learned rules into fix prompt
     kb_text = ""
     if st.session_state.knowledge_base:
         kb_text = "REMEMBER THESE RULES:\n" + "\n".join([f"- {r}" for r in st.session_state.knowledge_base])
@@ -244,7 +229,7 @@ def fix_code_ai(bad_code, error, model_name, problem_desc):
     INSTRUCTIONS:
     1. Fix the error logic/syntax only.
     2. Maintain strict fidelity to the problem parameters above.
-    3. Return the COMPLETE fixed code block.
+    3. Return the COMPLETE fixed code block. Do not return partial diffs.
     """
     resp = generate_with_retry(model, prompt)
     return extract_code(resp.text)
@@ -283,7 +268,7 @@ def validate_problem_logic(text, model_name):
 def create_word_report(problem, code, output, plots):
     if Document is None:
         return None
-    
+        
     doc = Document()
     doc.add_heading('Experiment Report', 0)
     
@@ -297,21 +282,22 @@ def create_word_report(problem, code, output, plots):
     
     # 3. Output/Errors
     doc.add_heading('3. Execution Output / Errors', level=1)
-    full_output = (output['out'] or "") + "\n" + (output['err'] or "")
-    if not full_output.strip():
-        full_output = "[No Output]"
-    doc.add_paragraph(full_output, style='Quote')
+    out_text = (output['out'] or "") + "\n" + (output['err'] or "")
+    if not out_text.strip(): out_text = "[No Output]"
+    doc.add_paragraph(out_text, style='Quote')
     
     # 4. Plots
     if plots:
         doc.add_heading('4. Generated Plots', level=1)
         for i, plot_bytes in enumerate(plots):
+            # Save temp file for FPDF
             temp_name = f"temp_plot_{i}.png"
             with open(temp_name, "wb") as f:
                 f.write(plot_bytes)
             doc.add_picture(temp_name, width=Inches(6))
             os.remove(temp_name)
-    
+            
+    # Save to memory stream
     doc_io = io.BytesIO()
     doc.save(doc_io)
     doc_io.seek(0)
@@ -386,7 +372,7 @@ if (uploaded_file or st.session_state.show_review) and selected_model_name:
                         # RAG: Inject Knowledge Base
                         kb_str = ""
                         if st.session_state.knowledge_base:
-                            kb_str = "CRITICAL USER OVERRIDES (YOU MUST FOLLOW THESE RULES):\n" + "\n".join([f"- {r}" for r in st.session_state.knowledge_base])
+                            kb_str = "USER RULES (STRICT):\n" + "\n".join([f"- {r}" for r in st.session_state.knowledge_base])
                             st.toast(f"Applying {len(st.session_state.knowledge_base)} user rules...")
 
                         # SANITIZED TEMPLATE
@@ -415,6 +401,8 @@ if (uploaded_file or st.session_state.show_review) and selected_model_name:
                         REFERENCE TEMPLATE:
                         {CVXPY_TEMPLATE}
 
+                        {kb_str}
+
                         DESCRIPTION (SOURCE OF TRUTH):
                         {live_problem_description}
                         
@@ -433,8 +421,6 @@ if (uploaded_file or st.session_state.show_review) and selected_model_name:
                         7. DATA INTEGRITY:
                            - ONLY define matrices listed in DESCRIPTION.
                            - Do NOT invent parameters.
-                           
-                        {kb_str}
                         """
                         response = generate_with_retry(model, prompt)
                         found_code = extract_code(response.text)
@@ -498,25 +484,20 @@ if st.session_state.active_code:
                             st.error("AI could not fix the code.")
             else:
                 st.success("No errors.")
-        
-        # Word Report Button
-        st.divider()
-        if st.button("📄 Download Word Report (.docx)"):
-            if Document is not None:
-                try:
-                    word_bytes = create_word_report(
-                        st.session_state.extracted_text,
-                        edited_code,
-                        res,
-                        res['plots']
-                    )
-                    st.download_button(
-                        label="Click to Download DOCX",
-                        data=word_bytes,
-                        file_name=f"{st.session_state.current_case_name or 'report'}.docx",
-                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                    )
-                except Exception as e:
-                    st.error(f"Report Generation Error: {e}")
-            else:
-                st.error("Missing 'python-docx' library. Please update requirements.txt.")
+                # PDF REPORT BUTTON
+                if st.button("📄 Download Word Report (.docx)"):
+                    try:
+                        word_bytes = create_word_report(
+                            st.session_state.extracted_text,
+                            edited_code,
+                            res,
+                            res['plots']
+                        )
+                        st.download_button(
+                            label="Click to Download DOCX",
+                            data=word_bytes,
+                            file_name=f"{st.session_state.current_case_name or 'report'}.docx",
+                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                        )
+                    except Exception as e:
+                        st.error(f"Report Generation Error: {e}")
