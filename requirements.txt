@@ -5,4 +5,4 @@ Pillow
 cvxpy
 numpy
 matplotlib
-scipy
+scipypython-docx
