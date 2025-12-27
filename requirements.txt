@@ -2,8 +2,8 @@ streamlit
 pymupdf
 google-generativeai
 Pillow
-cvxpy==1.4.2
-numpy<2
+cvxpy>=1.6.0
+numpy
 matplotlib
 scipy
 python-docx
