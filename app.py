@@ -31,13 +31,12 @@ with st.sidebar:
     # A. API KEY (Bring Your Own Key)
     api_key = st.text_input("1. Enter Google API Key", type="password")
     
-    # B. STRICT MODEL SELECTION
+    # B. DYNAMIC MODEL SELECTOR
     selected_model_name = None
     if api_key:
         try:
             genai.configure(api_key=api_key)
             # Verify key validity by making a lightweight call
-            # We don't need the full list since we are forcing one model
             list(genai.list_models()) 
             
             st.success("Key Valid!")
@@ -73,6 +72,10 @@ with st.sidebar:
                     st.session_state.knowledge_base.pop(i)
                     with open(KB_FILE, "w") as f: json.dump(st.session_state.knowledge_base, f)
                     st.rerun()
+        if st.button("🗑️ Clear All Rules"):
+            st.session_state.knowledge_base = []
+            with open(KB_FILE, "w") as f: json.dump([], f)
+            st.rerun()
 
     st.divider()
     
@@ -207,16 +210,15 @@ def run_code_backend(code):
 
 def fix_code_ai(bad_code, error, model_name, problem_desc):
     model = genai.GenerativeModel(model_name)
-    # RAG: Inject learned rules into fix prompt
+    # RAG: Inject learned rules into fix prompt at the END for recency bias
     kb_text = ""
     if st.session_state.knowledge_base:
-        kb_text = "REMEMBER THESE RULES:\n" + "\n".join([f"- {r}" for r in st.session_state.knowledge_base])
+        kb_text = "CRITICAL USER RULES (YOU MUST APPLY THESE):\n" + "\n".join([f"- {r}" for r in st.session_state.knowledge_base])
     
     prompt = f"""
     You are an expert Python debugger. Fix the error in the code below.
     
-    CRITICAL: You must NOT change the problem parameters (matrices A, b, etc.) defined below.
-    PROBLEM DESCRIPTION (SOURCE OF TRUTH):
+    PROBLEM DESCRIPTION (SOURCE OF TRUTH - DO NOT CHANGE MATRICES):
     {problem_desc}
     
     ERROR: {error}
@@ -224,12 +226,14 @@ def fix_code_ai(bad_code, error, model_name, problem_desc):
     BROKEN CODE:
     {bad_code}
     
+    INSTRUCTIONS:
+    1. Fix the syntax/logic error.
+    2. Do NOT change matrix values from the description.
+    3. If the error is 'broadcasting', use .reshape(n,1) on vectors.
+    
     {kb_text}
     
-    INSTRUCTIONS:
-    1. Fix the error logic/syntax only.
-    2. Maintain strict fidelity to the problem parameters above.
-    3. Return the COMPLETE fixed code block. Do not return partial diffs.
+    Return ONLY the complete fixed code.
     """
     resp = generate_with_retry(model, prompt)
     return extract_code(resp.text)
@@ -237,11 +241,17 @@ def fix_code_ai(bad_code, error, model_name, problem_desc):
 def learn_from_fix(original_error, fixed_code, model_name):
     model = genai.GenerativeModel(model_name)
     prompt = f"""
-    Analyze this error and fix.
+    Analyze this error and the fix provided.
+    
     Error: "{original_error}"
-    Fix Code Snippet:
+    
+    Fixed Code Snippet:
     {fixed_code}
-    Extract ONE short, generic rule (1 sentence) to prevent this mistake in future (e.g. "Use cp.Variable((n,1)) for vectors").
+    
+    TASK: Extract ONE specific, technical rule to prevent this exact mistake in the future.
+    Bad Rule: "Fix dimensions."
+    Good Rule: "Always use cp.Variable((n,1)) for vectors instead of (n,)."
+    Good Rule: "Use * for scalar multiplication, not @."
     """
     resp = generate_with_retry(model, prompt)
     return resp.text.strip()
@@ -333,7 +343,7 @@ if (uploaded_file or st.session_state.show_review) and selected_model_name:
                 try:
                     model = genai.GenerativeModel(selected_model_name)
                     # VERBATIM PROMPT
-                    inputs = ["Extract the problem statement VERBATIM from these images. Do NOT correct any errors. If a matrix looks wrong, transcribe it exactly as written. Do not generate code yet."] + st.session_state.pdf_images
+                    inputs = ["Extract the problem statement VERBATIM from these images. Correct obvious OCR typos (e.g. 'O' vs '0', 'l' vs '1') but keep matrix values strictly as written. Do not generate code yet."] + st.session_state.pdf_images
                     response = generate_with_retry(model, inputs)
                     st.session_state.extracted_text = response.text
                     st.session_state.show_review = True
@@ -372,10 +382,10 @@ if (uploaded_file or st.session_state.show_review) and selected_model_name:
                         # RAG: Inject Knowledge Base
                         kb_str = ""
                         if st.session_state.knowledge_base:
-                            kb_str = "USER RULES (STRICT):\n" + "\n".join([f"- {r}" for r in st.session_state.knowledge_base])
+                            kb_str = "CRITICAL USER OVERRIDES (YOU MUST FOLLOW THESE RULES):\n" + "\n".join([f"- {r}" for r in st.session_state.knowledge_base])
                             st.toast(f"Applying {len(st.session_state.knowledge_base)} user rules...")
 
-                        # SANITIZED TEMPLATE
+                        # SANITIZED & DEFENSIVE TEMPLATE
                         CVXPY_TEMPLATE = """
                         import cvxpy as cp
                         import numpy as np
@@ -383,6 +393,10 @@ if (uploaded_file or st.session_state.show_review) and selected_model_name:
                         
                         # 1. INPUT DATA (Load from description ONLY)
                         # n = ...
+                        
+                        # DEFENSIVE: Explicitly reshape inputs to avoid broadcasting errors
+                        # A = np.array(...).reshape(n, n)
+                        # b = np.array(...).reshape(n, 1) # Force column vector
                         
                         # 2. VARIABLES
                         # x = cp.Variable((n, 1)) # Explicit column vector
@@ -400,8 +414,6 @@ if (uploaded_file or st.session_state.show_review) and selected_model_name:
                         
                         REFERENCE TEMPLATE:
                         {CVXPY_TEMPLATE}
-
-                        {kb_str}
 
                         DESCRIPTION (SOURCE OF TRUTH):
                         {live_problem_description}
@@ -421,6 +433,8 @@ if (uploaded_file or st.session_state.show_review) and selected_model_name:
                         7. DATA INTEGRITY:
                            - ONLY define matrices listed in DESCRIPTION.
                            - Do NOT invent parameters.
+                           
+                        {kb_str}
                         """
                         response = generate_with_retry(model, prompt)
                         found_code = extract_code(response.text)
@@ -484,20 +498,25 @@ if st.session_state.active_code:
                             st.error("AI could not fix the code.")
             else:
                 st.success("No errors.")
-                # PDF REPORT BUTTON
-                if st.button("📄 Download Word Report (.docx)"):
-                    try:
-                        word_bytes = create_word_report(
-                            st.session_state.extracted_text,
-                            edited_code,
-                            res,
-                            res['plots']
-                        )
-                        st.download_button(
-                            label="Click to Download DOCX",
-                            data=word_bytes,
-                            file_name=f"{st.session_state.current_case_name or 'report'}.docx",
-                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                        )
-                    except Exception as e:
-                        st.error(f"Report Generation Error: {e}")
+        
+        # Word Report Button
+        st.divider()
+        if st.button("📄 Download Word Report (.docx)"):
+            if Document is not None:
+                try:
+                    word_bytes = create_word_report(
+                        st.session_state.extracted_text,
+                        edited_code,
+                        res,
+                        res['plots']
+                    )
+                    st.download_button(
+                        label="Click to Download DOCX",
+                        data=word_bytes,
+                        file_name=f"{st.session_state.current_case_name or 'report'}.docx",
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                    )
+                except Exception as e:
+                    st.error(f"Report Generation Error: {e}")
+            else:
+                st.error("Missing 'python-docx' library. Please update requirements.txt.")
