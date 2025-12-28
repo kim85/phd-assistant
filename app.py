@@ -37,14 +37,26 @@ with st.sidebar:
         try:
             genai.configure(api_key=api_key)
             # Verify key validity by making a lightweight call
-            list(genai.list_models()) 
+            all_models = genai.list_models()
             
-            st.success("Key Valid!")
+            model_list = []
+            for m in all_models:
+                if 'generateContent' in m.supported_generation_methods:
+                    name = m.name.lower()
+                    # Filter for vision-capable models
+                    if any(ver in name for ver in ['1.5', '2.0', '2.5', '3.0', 'vision', 'lite']):
+                        model_list.append(m.name)
             
-            # STRICT LIMIT: Force only this model
-            selected_model_name = "models/gemini-2.5-flash-lite"
-            st.info(f"🔒 Using required model:\n**{selected_model_name}**")
-            
+            # Smart Sort: Prioritize 2.5 Flash Lite if available
+            model_list.sort(key=lambda x: "flash-lite" in x, reverse=True)
+
+            if model_list:
+                # Default to the first one (which should be flash-lite if sorted correctly)
+                selected_model_name = st.selectbox("2. Select AI Model", model_list, index=0)
+                st.success(f"Connected to {selected_model_name}")
+            else:
+                st.error("Key valid, but no compatible Vision models found.")
+                
         except Exception as e:
             st.error(f"API Key Error: {e}")
 
@@ -142,9 +154,9 @@ with st.sidebar:
             run_data = data.get("run_output")
             if run_data:
                 st.session_state.run_output = {
-                    "out": run_data["out"],
-                    "err": run_data["err"],
-                    "plots": [base64.b64decode(p) for p in run_data["plots"]]
+                    "out": run_data.get("out", ""),
+                    "err": run_data.get("err", ""),
+                    "plots": [base64.b64decode(p) for p in run_data.get("plots", [])]
                 }
             else:
                 st.session_state.run_output = None
@@ -196,9 +208,10 @@ def run_code_backend(code):
 
     patched_code = "import matplotlib\nmatplotlib.use('Agg')\n" + code
     try:
-        proc = subprocess.run([sys.executable, "-c", patched_code], capture_output=True, text=True, timeout=20)
+        # 60s timeout for complex solvers
+        proc = subprocess.run([sys.executable, "-c", patched_code], capture_output=True, text=True, timeout=60)
     except subprocess.TimeoutExpired:
-        return "", "Error: Timeout (20s). Infinite loop likely.", []
+        return "", "Error: Timeout (60s). Infinite loop likely.", []
 
     plots = []
     for f in glob.glob("*.png"):
@@ -229,8 +242,10 @@ def fix_code_ai(bad_code, error, model_name, problem_desc):
     INSTRUCTIONS:
     1. Fix the syntax/logic error.
     2. Do NOT change matrix values from the description.
-    3. If the error is 'broadcasting', use .reshape(n,1) on vectors.
-    4. Ensure solvers are called in a try-except loop (CLARABEL, SCS, ECOS).
+    3. IMPORTANT: Use `cp.bmat` for Block Matrices. Do NOT use `cp.hstack` or `vstack` as they fail with scalar/matrix mixing.
+    4. RESHAPE SCALARS: Before putting a scalar (like gamma, nu) into `cp.bmat`, reshape it: `gamma_block = cp.reshape(gamma, (1, 1))`.
+    5. Ensure solvers are called in a try-except loop (CLARABEL, SCS, ECOS).
+    6. Use raw strings (r"...") for comments containing backslashes.
     
     {kb_text}
     
@@ -291,9 +306,10 @@ def create_word_report(problem, code, output, plots, knowledge_base=None):
     doc.add_heading('2. Python Code', level=1)
     doc.add_paragraph(code, style='Quote')
     
-    # 3. Output
-    doc.add_heading('3. Execution Output', level=1)
-    out_text = output['out'] or "[No Standard Output]"
+    # 3. Output/Errors
+    doc.add_heading('3. Execution Output / Errors', level=1)
+    out_text = (output['out'] or "") + "\n" + (output['err'] or "")
+    if not out_text.strip(): out_text = "[No Output]"
     doc.add_paragraph(out_text, style='Quote')
 
     # 4. Errors (Explicit section)
@@ -438,7 +454,7 @@ if (uploaded_file or st.session_state.show_review) and selected_model_name:
                         """
 
                         prompt = f"""
-                        You are a strict coder. Implement the experiment EXACTLY as described.
+                        You are an expert Control Theory coder. Write a Python script to solve the problem described.
                         
                         REFERENCE TEMPLATE:
                         {CVXPY_TEMPLATE}
@@ -446,22 +462,13 @@ if (uploaded_file or st.session_state.show_review) and selected_model_name:
                         DESCRIPTION (SOURCE OF TRUTH):
                         {live_problem_description}
                         
-                        STANDARD RULES:
-                        1. Use a SOLVER LOOP (CLARABEL, SCS, ECOS) to ensure robustness.
-                        2. Use `angle=` for Ellipse.
-                        3. Save to 'plot.png'. DO NOT use plt.show().
-                        4. CRITICAL DIMENSIONS:
-                           - If `b` is (n,1), `x` MUST be `cp.Variable((n,1))` to avoid broadcasting errors.
-                           - `A @ x - b` requires `x` to be a column vector.
-                        5. Use `*` for scalar mult, `<< 0` for LMI (PSD).
-                        6. SYNTAX SAFETY:
-                           - Ensure all np.array definitions use `dtype=float`.
-                           - Use `cp.reshape(..., order='F')` to silence warnings.
-                           - Use `np.sqrt(max(val, 0))` for square roots.
-                           - NEVER use variable name `lambda`. Use `lam`.
-                        7. DATA INTEGRITY:
-                           - ONLY define matrices listed in DESCRIPTION.
-                           - Do NOT invent parameters.
+                        CRITICAL RULES:
+                        1. Use `cp.bmat` for LMIs. Do NOT use `hstack` or `vstack` manually for block matrices (it causes dimension errors).
+                        2. Reshape ALL scalars (like gamma/nu/rho) to (1, 1) before putting them in a matrix. Example: `gamma_block = cp.reshape(gamma, (1, 1))`
+                        3. Reshape ALL vectors to (n, 1) or (1, n). Never use flat (n,) arrays.
+                        4. Use raw strings (r"...") for any text with backslashes (like LaTeX comments).
+                        5. Use a SOLVER LOOP (CLARABEL, SCS, ECOS) to ensure robustness.
+                        6. Data Integrity: Use the exact matrices from the description.
                            
                         {kb_str}
                         """
@@ -488,12 +495,17 @@ if st.session_state.active_code:
                 out, err, plots = run_code_backend(edited_code)
                 st.session_state.run_output = {"out": out, "err": err, "plots": plots}
     
+    # RESULTS: Displayed regardless of success/failure so Download button is always visible
     if st.session_state.run_output:
         res = st.session_state.run_output
         t1, t2, t3 = st.tabs(["Plots", "Output", "Errors"])
         with t1:
-            for p in res['plots']: st.image(p)
-        with t2: st.code(res['out'] if res['out'] else "No text output.")
+            if res['plots']:
+                for p in res['plots']: st.image(p)
+            else:
+                st.info("No plots generated yet.")
+        with t2:
+            st.code(res['out'] if res['out'] else "No text output.")
         with t3:
             if res['err']:
                 st.error(res['err'])
@@ -515,6 +527,7 @@ if st.session_state.active_code:
                             # 3. Save rule
                             if new_rule:
                                 st.session_state.knowledge_base.append(new_rule)
+                                # Save to disk automatically
                                 with open("knowledge_base.json", "w") as f:
                                     json.dump(st.session_state.knowledge_base, f)
                                 st.toast(f"Learned: {new_rule}")
@@ -526,9 +539,9 @@ if st.session_state.active_code:
                         else:
                             st.error("AI could not fix the code.")
             else:
-                st.success("No errors.")
+                st.success("No errors detected.")
         
-        # Word Report Button
+        # Word Report Button - ALWAYS VISIBLE AT BOTTOM
         st.divider()
         if st.button("📄 Download Word Report (.docx)"):
             if Document is not None:
