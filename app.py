@@ -37,26 +37,14 @@ with st.sidebar:
         try:
             genai.configure(api_key=api_key)
             # Verify key validity by making a lightweight call
-            all_models = genai.list_models()
+            list(genai.list_models()) 
             
-            model_list = []
-            for m in all_models:
-                if 'generateContent' in m.supported_generation_methods:
-                    name = m.name.lower()
-                    # Filter for vision-capable models
-                    if any(ver in name for ver in ['1.5', '2.0', '2.5', '3.0', 'vision', 'lite']):
-                        model_list.append(m.name)
+            st.success("Key Valid!")
             
-            # Smart Sort: Prioritize 2.5 Flash Lite if available
-            model_list.sort(key=lambda x: "flash-lite" in x, reverse=True)
-
-            if model_list:
-                # Default to the first one (which should be flash-lite if sorted correctly)
-                selected_model_name = st.selectbox("2. Select AI Model", model_list, index=0)
-                st.success(f"Connected to {selected_model_name}")
-            else:
-                st.error("Key valid, but no compatible Vision models found.")
-                
+            # STRICT LIMIT: Force only this model
+            selected_model_name = "models/gemini-2.5-flash-lite"
+            st.info(f"🔒 Using required model:\n**{selected_model_name}**")
+            
         except Exception as e:
             st.error(f"API Key Error: {e}")
 
@@ -200,18 +188,26 @@ def generate_with_retry(model, inputs, retries=3):
             time.sleep(1)
 
 def run_code_backend(code):
-    try: import cvxpy, matplotlib, docx
-    except ImportError as e: return "", f"Missing library {e.name}. Install it.", []
+    # HEALTH CHECK: Print versions to debug log
+    try: 
+        import cvxpy
+        import numpy
+        # This print will show up in the "Output" tab of the app
+        print(f"DEBUG: Running on Python {sys.version.split()[0]}")
+        print(f"DEBUG: CVXPY Version: {cvxpy.__version__}")
+        print(f"DEBUG: NumPy Version: {numpy.__version__}")
+    except ImportError as e: 
+        return "", f"Missing library {e.name}. Install it.", []
 
     is_safe, msg = validate_code_safety(code)
     if not is_safe: return "", msg, []
 
     patched_code = "import matplotlib\nmatplotlib.use('Agg')\n" + code
     try:
-        # 60s timeout for complex solvers
+        # INCREASED TIMEOUT: Servers are slower than local machines
         proc = subprocess.run([sys.executable, "-c", patched_code], capture_output=True, text=True, timeout=60)
     except subprocess.TimeoutExpired:
-        return "", "Error: Timeout (60s). Infinite loop likely.", []
+        return "", "Error: Timeout (60s). The server is too slow or infinite loop.", []
 
     plots = []
     for f in glob.glob("*.png"):
@@ -242,10 +238,12 @@ def fix_code_ai(bad_code, error, model_name, problem_desc):
     INSTRUCTIONS:
     1. Fix the syntax/logic error.
     2. Do NOT change matrix values from the description.
-    3. IMPORTANT: Use `cp.bmat` for Block Matrices. Do NOT use `cp.hstack` or `vstack` as they fail with scalar/matrix mixing.
+    3. IMPORTANT: Use `cp.bmat` for Block Matrices. Do NOT use `cp.hstack` or `vstack` explicitly inside the script, let bmat handle it.
     4. RESHAPE SCALARS: Before putting a scalar (like gamma, nu) into `cp.bmat`, reshape it: `gamma_block = cp.reshape(gamma, (1, 1))`.
-    5. Ensure solvers are called in a try-except loop (CLARABEL, SCS, ECOS).
-    6. Use raw strings (r"...") for comments containing backslashes.
+    5. Ensure all blocks in a bmat row have the EXACT SAME HEIGHT. Reshape if necessary.
+    6. Ensure solvers are called in a try-except loop (CLARABEL, SCS, ECOS).
+    7. Use raw strings (r"...") for comments containing backslashes to avoid SyntaxWarnings.
+    8. Use order='F' for cp.flatten and cp.reshape to silence warnings.
     
     {kb_text}
     
@@ -306,10 +304,9 @@ def create_word_report(problem, code, output, plots, knowledge_base=None):
     doc.add_heading('2. Python Code', level=1)
     doc.add_paragraph(code, style='Quote')
     
-    # 3. Output/Errors
-    doc.add_heading('3. Execution Output / Errors', level=1)
-    out_text = (output['out'] or "") + "\n" + (output['err'] or "")
-    if not out_text.strip(): out_text = "[No Output]"
+    # 3. Output
+    doc.add_heading('3. Execution Output', level=1)
+    out_text = output['out'] or "[No Standard Output]"
     doc.add_paragraph(out_text, style='Quote')
 
     # 4. Errors (Explicit section)
@@ -432,8 +429,19 @@ if (uploaded_file or st.session_state.show_review) and selected_model_name:
                         # 2. VARIABLES
                         # x = cp.Variable((n, 1)) # Explicit column vector
                         
-                        # 3. CONSTRAINTS
-                        # constraints = []
+                        # 3. CONSTRAINTS (Using cp.bmat is safer than hstack/vstack)
+                        # Reshape scalars for bmat
+                        nu = cp.Variable()
+                        nu_block = cp.reshape(nu, (1, 1))
+                        
+                        # Example 2x2 block LMI
+                        # Row 1: [M, A@x - b]
+                        # Row 2: [(A@x - b).T, -nu_block]
+                        # LMI = cp.bmat([
+                        #     [M, A @ x - b],
+                        #     [(A @ x - b).T, -nu_block]
+                        # ])
+                        # constraints = [LMI << 0]
                         
                         # 4. SOLVE (Robust Fallback)
                         prob = cp.Problem(cp.Minimize(0), constraints)
@@ -463,12 +471,14 @@ if (uploaded_file or st.session_state.show_review) and selected_model_name:
                         {live_problem_description}
                         
                         CRITICAL RULES:
-                        1. Use `cp.bmat` for LMIs. Do NOT use `hstack` or `vstack` manually for block matrices (it causes dimension errors).
-                        2. Reshape ALL scalars (like gamma/nu/rho) to (1, 1) before putting them in a matrix. Example: `gamma_block = cp.reshape(gamma, (1, 1))`
+                        1. Use `cp.bmat` for LMIs. Do NOT use `cp.hstack` or `vstack` manually for block matrices (it causes dimension errors).
+                        2. Reshape ALL scalars (like gamma/nu/rho) to (1, 1) before putting them in a matrix. Example: `gamma_block = cp.reshape(gamma, (1, 1), order='F')`
                         3. Reshape ALL vectors to (n, 1) or (1, n). Never use flat (n,) arrays.
                         4. Use raw strings (r"...") for any text with backslashes (like LaTeX comments).
                         5. Use a SOLVER LOOP (CLARABEL, SCS, ECOS) to ensure robustness.
                         6. Data Integrity: Use the exact matrices from the description.
+                        7. Use `cp.flatten(..., order='F')` if using flatten.
+                        8. Verify Block Heights: In `cp.bmat`, all blocks in the same row list must have the exact same height.
                            
                         {kb_str}
                         """
