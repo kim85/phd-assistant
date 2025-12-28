@@ -230,6 +230,7 @@ def fix_code_ai(bad_code, error, model_name, problem_desc):
     1. Fix the syntax/logic error.
     2. Do NOT change matrix values from the description.
     3. If the error is 'broadcasting', use .reshape(n,1) on vectors.
+    4. Ensure solvers are called in a try-except loop (CLARABEL, SCS, ECOS).
     
     {kb_text}
     
@@ -275,7 +276,7 @@ def validate_problem_logic(text, model_name):
     resp = generate_with_retry(model, prompt)
     return resp.text
 
-def create_word_report(problem, code, output, plots):
+def create_word_report(problem, code, output, plots, knowledge_base=None):
     if Document is None:
         return None
         
@@ -290,15 +291,28 @@ def create_word_report(problem, code, output, plots):
     doc.add_heading('2. Python Code', level=1)
     doc.add_paragraph(code, style='Quote')
     
-    # 3. Output/Errors
-    doc.add_heading('3. Execution Output / Errors', level=1)
-    out_text = (output['out'] or "") + "\n" + (output['err'] or "")
-    if not out_text.strip(): out_text = "[No Output]"
+    # 3. Output
+    doc.add_heading('3. Execution Output', level=1)
+    out_text = output['out'] or "[No Standard Output]"
     doc.add_paragraph(out_text, style='Quote')
+
+    # 4. Errors (Explicit section)
+    if output['err']:
+        doc.add_heading('4. Errors Detected', level=1)
+        doc.add_paragraph(output['err'], style='Quote')
+
+    # 5. Learned Rules (Knowledge Base)
+    if knowledge_base:
+        doc.add_heading('5. Learned Rules (Knowledge Base)', level=1)
+        if not knowledge_base:
+             doc.add_paragraph("No specific rules learned for this case yet.")
+        else:
+            for rule in knowledge_base:
+                doc.add_paragraph(rule, style='List Bullet')
     
-    # 4. Plots
+    # 6. Plots
     if plots:
-        doc.add_heading('4. Generated Plots', level=1)
+        doc.add_heading('6. Generated Plots', level=1)
         for i, plot_bytes in enumerate(plots):
             # Save temp file for FPDF
             temp_name = f"temp_plot_{i}.png"
@@ -395,8 +409,9 @@ if (uploaded_file or st.session_state.show_review) and selected_model_name:
                         # n = ...
                         
                         # DEFENSIVE: Explicitly reshape inputs to avoid broadcasting errors
-                        # A = np.array(...).reshape(n, n)
-                        # b = np.array(...).reshape(n, 1) # Force column vector
+                        # Use dtype=float to prevent integer math issues
+                        # A = np.array(..., dtype=float).reshape(n, n)
+                        # b = np.array(..., dtype=float).reshape(n, 1) # Force column vector
                         
                         # 2. VARIABLES
                         # x = cp.Variable((n, 1)) # Explicit column vector
@@ -404,9 +419,22 @@ if (uploaded_file or st.session_state.show_review) and selected_model_name:
                         # 3. CONSTRAINTS
                         # constraints = []
                         
-                        # 4. SOLVE
-                        # prob = cp.Problem(cp.Minimize(0), constraints)
-                        # prob.solve(solver=cp.SCS)
+                        # 4. SOLVE (Robust Fallback)
+                        prob = cp.Problem(cp.Minimize(0), constraints)
+                        
+                        # Try multiple solvers in case one fails on the platform
+                        solved = False
+                        for solver in [cp.CLARABEL, cp.SCS, cp.ECOS]:
+                            try:
+                                prob.solve(solver=solver)
+                                if prob.status in ["optimal", "optimal_inaccurate"]:
+                                    solved = True
+                                    break
+                            except:
+                                continue
+                        
+                        if not solved:
+                            print("Warning: All solvers failed or problem is infeasible.")
                         """
 
                         prompt = f"""
@@ -419,7 +447,7 @@ if (uploaded_file or st.session_state.show_review) and selected_model_name:
                         {live_problem_description}
                         
                         STANDARD RULES:
-                        1. Use `cp.SCS` for cvxpy solver.
+                        1. Use a SOLVER LOOP (CLARABEL, SCS, ECOS) to ensure robustness.
                         2. Use `angle=` for Ellipse.
                         3. Save to 'plot.png'. DO NOT use plt.show().
                         4. CRITICAL DIMENSIONS:
@@ -427,6 +455,7 @@ if (uploaded_file or st.session_state.show_review) and selected_model_name:
                            - `A @ x - b` requires `x` to be a column vector.
                         5. Use `*` for scalar mult, `<< 0` for LMI (PSD).
                         6. SYNTAX SAFETY:
+                           - Ensure all np.array definitions use `dtype=float`.
                            - Use `cp.reshape(..., order='F')` to silence warnings.
                            - Use `np.sqrt(max(val, 0))` for square roots.
                            - NEVER use variable name `lambda`. Use `lam`.
@@ -508,7 +537,8 @@ if st.session_state.active_code:
                         st.session_state.extracted_text,
                         edited_code,
                         res,
-                        res['plots']
+                        res['plots'],
+                        st.session_state.knowledge_base
                     )
                     st.download_button(
                         label="Click to Download DOCX",
