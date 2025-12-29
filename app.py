@@ -33,7 +33,7 @@ with st.sidebar:
         try:
             genai.configure(api_key=api_key)
             models = list(genai.list_models())
-            # Prioritize Gemini 1.5 Flash or Pro for technical reasoning
+            # Filtering for Flash models (Fast/Cheap) or Pro (Powerful)
             valid_models = [m.name for m in models if 'generateContent' in m.supported_generation_methods]
             valid_models.sort(key=lambda x: (not '1.5' in x, not 'pro' in x))
             if valid_models:
@@ -71,11 +71,8 @@ with st.sidebar:
             st.session_state.current_case_name = load_name
             st.session_state.extracted_text = data.get("extracted_text", "")
             st.session_state.architect_plan = data.get("plan", "")
-            st.session_state.active_code = data.get("code", "")
+            st.session_state.active_code = data.get("active_code", "")
             st.rerun()
-
-    st.divider()
-    uploaded_file = st.file_uploader("Upload Problem PDF", type="pdf")
 
 # --- 3. AGENTIC CORE LOGIC ---
 
@@ -84,8 +81,9 @@ def extract_code(text):
     match = re.search(r"```(python|py)?\n(.*?)```", text, re.DOTALL)
     if match:
         code = match.group(2).strip()
-        # Active Sanitization
-        return code.replace("<<=", "<<").replace(">>=", ">>")
+        # Fix the most common hallucinated operators
+        code = code.replace("<<=", "<<").replace(">>=", ">>")
+        return code
     return None
 
 def run_architect_agent(problem, model_name):
@@ -96,31 +94,34 @@ def run_architect_agent(problem, model_name):
     TASK:
     1. Define specific dimensions for all matrices (n, m, l).
     2. List every block in the LMI and its specific (rows x cols) size.
-    3. Identify symmetry: If Block(i,j) is a term, Block(j,i) must be its Transpose.
-    4. Dimension Rule: All blocks in Row X must have the same height. All blocks in Col Y must have the same width.
+    3. Identify which variables are SCALARS (e.g., lambda, nu) and which are MATRICES (e.g., P, K).
+    4. Dimension Rule: All blocks in Row X must have the same height. 
     Return a structural plan. No code.
     """
     return model.generate_content(prompt).text
 
 def run_coder_agent(plan, template, model_name):
-    """Phase 2: Translates the Ledger into CVXPY code."""
+    """Phase 2: Translates the Ledger into CVXPY code with strict operator enforcement."""
     model = genai.GenerativeModel(model_name)
     prompt = f"""
     Math Plan: {plan}
     Reference Style: {template}
     
-    BMAT SAFETY PROTOCOL:
-    1. Define variables H1, H2... for row heights and W1, W2... for col widths.
-    2. Use `np.zeros((Hi, Wj))` for all zero blocks. 
-    3. Mandatory: Use `cp.CLARABEL` as the primary solver.
-    4. Use r"..." strings for all Matplotlib labels with LaTeX symbols.
+    CRITICAL SYNTAX RULES:
+    1. SCALAR OPERATOR: If multiplying a scalar variable (like lambda or nu) by a matrix (like F or I), 
+       YOU MUST USE `*`. Example: `F * lam`. 
+       DO NOT use `@` with scalars (e.g., `F @ lam` is a ValueError).
+    2. MATRIX OPERATOR: Use `@` ONLY for Matrix-Matrix or Matrix-Vector products.
+    3. BMAT SAFETY: Use `np.zeros((rows, cols))` for all zero blocks. NEVER use scalar 0.
+    4. LATEX SAFETY: Use raw strings `r"..."` for all plot labels/titles containing backslashes or LaTeX.
+    
     Return ONLY the python code.
     """
     code_text = model.generate_content(prompt).text
     return extract_code(code_text)
 
 def run_code_backend(code):
-    """Executes code in a sub-process with an injected non-interactive plotting patch."""
+    """Executes code with an injected non-interactive plotting patch."""
     patch = (
         "import matplotlib\n"
         "matplotlib.use('Agg')\n"
@@ -152,23 +153,24 @@ with tab_theory:
     col_left, col_right = st.columns(2)
     with col_left:
         st.subheader("Source PDF Analysis")
+        uploaded_file = st.file_uploader("Upload Problem PDF", type="pdf")
         if uploaded_file:
             doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
             imgs = [Image.open(io.BytesIO(p.get_pixmap(dpi=150).tobytes("png"))) for p in doc]
             if st.button("🔍 Extract Verbatim Math"):
-                with st.spinner("Gemini is reading..."):
+                with st.spinner("Extracting..."):
                     m = genai.GenerativeModel(selected_model_name)
-                    st.session_state.extracted_text = m.generate_content(["Extract LMI matrices, dimensions, and variables exactly."] + imgs).text
+                    st.session_state.extracted_text = m.generate_content(["Extract LMI matrices and dimensions exactly."] + imgs).text
         
         prob_desc = st.text_area("Problem Metadata", value=st.session_state.get("extracted_text", ""), height=350)
 
     with col_right:
         st.subheader("The Architect's Ledger")
         if st.button("🏗️ Build Dimensional Plan"):
-            with st.spinner("Planning dimensions..."):
+            with st.spinner("Analyzing math structure..."):
                 st.session_state.architect_plan = run_architect_agent(prob_desc, selected_model_name)
         
-        plan_input = st.text_area("Ledger (Verify rows/cols here)", value=st.session_state.architect_plan, height=350)
+        plan_input = st.text_area("Ledger (Verify dimensions here)", value=st.session_state.architect_plan, height=350)
 
 with tab_workbench:
     # Golden Template Management
@@ -182,7 +184,7 @@ with tab_workbench:
             with open(SETTINGS_FILE, "w") as f: json.dump({"golden_code": curr_t}, f)
 
     if st.button("🚀 Write Code from Plan", type="primary"):
-        with st.spinner("Coder Agent is writing..."):
+        with st.spinner("Enforcing syntax rules..."):
             st.session_state.active_code = run_coder_agent(plan_input, curr_t, selected_model_name)
     
     code_final = st.text_area("Python Script", value=st.session_state.active_code, height=450)
@@ -190,14 +192,19 @@ with tab_workbench:
     col_run, col_report = st.columns([1,1])
     with col_run:
         if st.button("▶️ Execute Experiment"):
-            with st.spinner("Solver running (Clarabel)..."):
+            with st.spinner("Running Solver..."):
                 out, err, plots = run_code_backend(code_final)
                 st.session_state.run_results = {"out": out, "err": err, "plots": plots}
 
     if "run_results" in st.session_state:
         res = st.session_state.run_results
-        if res['err']: st.error(res['err'])
-        if res['out']: st.code(res['out'])
+        if res['err']:
+            st.error("Error Detected (Likely Dimension or Operator Error):")
+            st.code(res['err'])
+        
+        if res['out']:
+            st.info("Solver Output:")
+            st.code(res['out'])
         
         for p in res['plots']:
             st.image(p)
@@ -206,8 +213,6 @@ with tab_workbench:
             if Document and st.button("📄 Export to Word"):
                 doc = Document()
                 doc.add_heading("Experiment Report", 0)
-                doc.add_heading("Dimensional Plan", level=1)
-                doc.add_paragraph(plan_input)
                 doc.add_heading("Generated Code", level=1)
                 doc.add_paragraph(code_final)
                 if res['plots']:
@@ -221,4 +226,4 @@ with tab_workbench:
                 doc_io = io.BytesIO()
                 doc.save(doc_io)
                 doc_io.seek(0)
-                st.download_button("📥 Download .docx", doc_io, "PhD_Report.docx")
+                st.download_button("📥 Download Report", doc_io, "PhD_Report.docx")
