@@ -162,7 +162,8 @@ def run_architect_agent(problem, model_name):
         
         Return a concise math plan (Plain text/Markdown).
         """
-        plan_resp = model.generate_content(architect_prompt)
+        # FIX: Low temperature for stable reasoning
+        plan_resp = model.generate_content(architect_prompt, generation_config={"temperature": 0.1})
         return plan_resp.text
 
 def run_coder_and_debugger(plan, template, model_name):
@@ -183,9 +184,15 @@ def run_coder_and_debugger(plan, template, model_name):
           Correct: plt.xlabel(r"Value of $\\rho$")
           Wrong: plt.xlabel("Value of $\\rho$")
         - Solver Robustness: Use a loop [cp.CLARABEL, cp.SCS, cp.ECOS] to handle "inaccurate solution" warnings.
+        
+        SOLVER SPECIFIC RULES:
+        1. CLARABEL does NOT accept 'eps'. Do not pass it.
+        2. When printing errors, do NOT use `solver.name` (solver is likely a string). Use `str(solver)` or `solver`.
+        
         Return ONLY the code block.
         """
-        code_resp = model.generate_content(coder_prompt)
+        # FIX: Zero temperature for deterministic code generation
+        code_resp = model.generate_content(coder_prompt, generation_config={"temperature": 0.0})
         raw_code = extract_code(code_resp.text)
         status.update(label="💻 Coder: Draft complete!", state="complete")
 
@@ -200,12 +207,13 @@ def run_coder_and_debugger(plan, template, model_name):
         2. Dimension mismatches in `cp.bmat`.
         3. Incorrect operator use (using `@` with a scalar).
         4. STRING SAFETY: Ensure all plot titles/labels using LaTeX (e.g. $\\gamma$) use `r"..."` strings.
-           - Bad: plt.title("$\\gamma$")
-           - Good: plt.title(r"$\\gamma$")
+        5. SOLVER CRASHES: Ensure 'eps' is NOT passed to CLARABEL.
+        6. ATTRIBUTE ERRORS: Ensure `solver.name` is NOT used (replace with `solver`).
         
         If errors exist, return the FULL FIXED code. If it is perfect, return the original code.
         """
-        final_resp = model.generate_content(debugger_prompt)
+        # FIX: Zero temperature for strict checking
+        final_resp = model.generate_content(debugger_prompt, generation_config={"temperature": 0.0})
         final_code = extract_code(final_resp.text)
         
         if final_code:
