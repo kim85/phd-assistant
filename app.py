@@ -11,6 +11,7 @@ import os
 import json
 import time
 import base64
+import uuid
 
 # Robust Import for Word generation
 try:
@@ -21,68 +22,46 @@ except ImportError:
     Inches = None
 
 # --- 1. CONFIGURATION ---
-st.set_page_config(page_title="PhD Assistant", layout="wide")
-st.title("PhD Assistant: Experiment Designer 🧪")
+st.set_page_config(page_title="PhD Agent: Experiment Designer", layout="wide")
+st.title("PhD Assistant: Agentic Experiment Designer 🧪")
 
-# --- 2. SIDEBAR (Setup) ---
+# --- 2. SIDEBAR ---
 with st.sidebar:
     st.header("⚙️ Configuration")
-    
-    # A. API KEY (Bring Your Own Key)
     api_key = st.text_input("1. Enter Google API Key", type="password")
     
-    # B. DYNAMIC MODEL SELECTOR
     selected_model_name = None
     if api_key:
         try:
             genai.configure(api_key=api_key)
-            # Verify key validity by making a lightweight call
-            list(genai.list_models()) 
+            models = list(genai.list_models())
             
-            st.success("Key Valid!")
+            # Filter specifically for Flash or Flash-Lite models
+            valid_models = [
+                m.name for m in models 
+                if 'generateContent' in m.supported_generation_methods 
+                and 'flash' in m.name.lower()
+            ]
             
-            # STRICT LIMIT: Force only this model
-            selected_model_name = "models/gemini-2.5-flash-lite"
-            st.info(f"🔒 Using required model:\n**{selected_model_name}**")
+            # Sort to likely show newest versions first
+            valid_models.sort(reverse=True)
             
+            if valid_models:
+                selected_model_name = st.selectbox("Select Model", valid_models, index=0)
+            else:
+                st.warning("No Flash models found. Using fallback.")
+                selected_model_name = "models/gemini-2.5-flash-lite" # Fallback
+                
         except Exception as e:
             st.error(f"API Key Error: {e}")
 
     st.divider()
     
-    # --- C. KNOWLEDGE BASE (RAG Feedback Loop) ---
-    st.header("🧠 Knowledge Base")
-    st.info("Rules learned from previous errors.")
-    
-    KB_FILE = "knowledge_base.json"
-    
-    if "knowledge_base" not in st.session_state:
-        if os.path.exists(KB_FILE):
-            try:
-                with open(KB_FILE, "r") as f: st.session_state.knowledge_base = json.load(f)
-            except: st.session_state.knowledge_base = []
-        else: st.session_state.knowledge_base = []
-
-    if st.session_state.knowledge_base:
-        with st.expander("View Rules", expanded=False):
-            for i, rule in enumerate(st.session_state.knowledge_base):
-                col1, col2 = st.columns([4, 1])
-                col1.write(f"- {rule}")
-                if col2.button("❌", key=f"del_{i}"):
-                    st.session_state.knowledge_base.pop(i)
-                    with open(KB_FILE, "w") as f: json.dump(st.session_state.knowledge_base, f)
-                    st.rerun()
-        if st.button("🗑️ Clear All Rules"):
-            st.session_state.knowledge_base = []
-            with open(KB_FILE, "w") as f: json.dump([], f)
-            st.rerun()
-
-    st.divider()
-    
-    # --- D. CASE MANAGEMENT (Saves Output + Plots) ---
+    # --- CASE MANAGEMENT ---
     st.header("💾 Case Management")
     HISTORY_FILE = "experiment_history.json"
     
+    # Init History
     if "history" not in st.session_state:
         if os.path.exists(HISTORY_FILE):
             try:
@@ -90,486 +69,313 @@ with st.sidebar:
             except: st.session_state.history = {}
         else: st.session_state.history = {}
     
-    if "current_case_name" not in st.session_state: st.session_state.current_case_name = None
+    if "current_case_name" not in st.session_state:
+        st.session_state.current_case_name = None
 
-    # New Case
+    # Helper Functions for Serialization
+    def serialize_run_output(run_output):
+        if not run_output: return None
+        return {
+            "out": run_output["out"],
+            "err": run_output["err"],
+            "plots": [base64.b64encode(p).decode('utf-8') for p in run_output["plots"]]
+        }
+
+    def deserialize_run_output(run_data):
+        if not run_data: return None
+        return {
+            "out": run_data.get("out", ""),
+            "err": run_data.get("err", ""),
+            "plots": [base64.b64decode(p) for p in run_data.get("plots", [])]
+        }
+
+    # 1. Create New Case
     save_name = st.text_input("New Case Name", placeholder="e.g. Test 1", label_visibility="collapsed")
     if st.button("💾 Create New Case"):
         if save_name:
-            # Capture current state to preserve work if valid
             st.session_state.history[save_name] = {
                 "extracted_text": st.session_state.get("extracted_text", ""),
+                "architect_plan": st.session_state.get("architect_plan", ""),
                 "active_code": st.session_state.get("active_code", ""),
-                "run_output": st.session_state.get("run_output", None)
+                "run_output": serialize_run_output(st.session_state.get("run_output", None))
             }
             st.session_state.current_case_name = save_name
             with open(HISTORY_FILE, "w") as f: json.dump(st.session_state.history, f)
             st.success(f"Created '{save_name}'!")
             st.rerun()
 
-    # Update Existing Case
+    # 2. Update Existing Case
     if st.session_state.current_case_name:
-        st.divider()
-        st.info(f"Editing: **{st.session_state.current_case_name}**")
-        if st.button("💾 Save All (Code + Output)", type="primary"):
-            # Serialize run output (including plots as base64)
-            serializable_output = None
-            if st.session_state.run_output:
-                serializable_output = {
-                    "out": st.session_state.run_output["out"],
-                    "err": st.session_state.run_output["err"],
-                    "plots": [base64.b64encode(p).decode('utf-8') for p in st.session_state.run_output["plots"]]
-                }
-
+        st.caption(f"Editing: **{st.session_state.current_case_name}**")
+        if st.button("💾 Save All (Sidebar)", type="secondary"):
             st.session_state.history[st.session_state.current_case_name] = {
                 "extracted_text": st.session_state.get("extracted_text", ""),
+                "architect_plan": st.session_state.get("architect_plan", ""),
                 "active_code": st.session_state.get("active_code", ""),
-                "run_output": serializable_output
+                "run_output": serialize_run_output(st.session_state.get("run_output", None))
             }
             with open(HISTORY_FILE, "w") as f: json.dump(st.session_state.history, f)
-            st.toast(f"Saved '{st.session_state.current_case_name}' with outputs!")
+            st.toast(f"Saved '{st.session_state.current_case_name}'!")
 
-    # Load Case
+    # 3. Load Case
     if st.session_state.history:
-        st.divider()
-        load_name = st.selectbox("Select Case to Load", list(st.session_state.history.keys()))
-        if st.button("📂 Load Case"):
+        load_name = st.selectbox("Load Case", list(st.session_state.history.keys()))
+        if st.button("📂 Load Selected"):
             data = st.session_state.history[load_name]
-            st.session_state.extracted_text = data.get("extracted_text", "")
-            st.session_state.active_code = data.get("active_code", "")
-            
-            # Deserialize outputs
-            run_data = data.get("run_output")
-            if run_data:
-                st.session_state.run_output = {
-                    "out": run_data.get("out", ""),
-                    "err": run_data.get("err", ""),
-                    "plots": [base64.b64decode(p) for p in run_data.get("plots", [])]
-                }
-            else:
-                st.session_state.run_output = None
-
             st.session_state.current_case_name = load_name
+            st.session_state.extracted_text = data.get("extracted_text", "")
+            st.session_state.architect_plan = data.get("architect_plan", "")
+            st.session_state.active_code = data.get("active_code", "")
+            st.session_state.run_output = deserialize_run_output(data.get("run_output"))
             st.session_state.show_review = True
-            st.success(f"Loaded '{load_name}'!")
             st.rerun()
 
     st.divider()
-    st.header("📂 Input")
     uploaded_file = st.file_uploader("3. Upload Notes (PDF)", type="pdf")
 
-# --- 3. SESSION STATE INIT ---
-if "messages" not in st.session_state: st.session_state.messages = []
-if "pdf_images" not in st.session_state: st.session_state.pdf_images = []
-if "active_code" not in st.session_state: st.session_state.active_code = ""
-if "run_output" not in st.session_state: st.session_state.run_output = None
-if "extracted_text" not in st.session_state: st.session_state.extracted_text = ""
-if "show_review" not in st.session_state: st.session_state.show_review = False
-if "validation_result" not in st.session_state: st.session_state.validation_result = None
-
-# --- 4. FUNCTIONS ---
+# --- 3. THE AGENTIC ENGINE ---
 
 def extract_code(text):
     match = re.search(r"```(python|py)?\n(.*?)```", text, re.DOTALL)
-    if match: return match.group(2).strip()
+    if match:
+        code = match.group(2).strip()
+        # SANITIZER: Hard-fix syntax hallucinations
+        code = code.replace("<<=", "<<").replace(">>=", ">>")
+        return code
     return None
 
-def validate_code_safety(code):
-    forbidden = ["os.system", "subprocess.Popen", "shutil.rmtree", "exec("]
-    for term in forbidden:
-        if term in code: return False, f"Security Risk: Code contains forbidden term '{term}'."
-    return True, ""
+def run_architect_agent(problem, model_name):
+    """Step 1: Generates the Math Plan"""
+    model = genai.GenerativeModel(model_name)
+    with st.spinner("🧠 Architect is planning the logic..."):
+        architect_prompt = f"""
+        Analyze this Control Theory problem:
+        {problem}
+        
+        TASK:
+        1. Identify the dimensions of all matrices (A, B, F, E_A, etc.).
+           - LOOK FOR CLUES: "I" usually means Identity (Square Matrix). "0" implies dimensions matching neighbors.
+           - CHECK COMPATIBILITY: If M = p*I and I is 2x2, then M must be 2x2 (not a vector).
+        2. Map the LMI block structure.
+        3. Identify which variables are scalars (1x1) vs matrices.
+        4. Explicitly state the multiplication rule: "Scalar (1x1) * Matrix" uses `*`, "Matrix * Matrix" uses `@`.
+        
+        Return a concise math plan (Plain text/Markdown).
+        """
+        plan_resp = model.generate_content(architect_prompt)
+        return plan_resp.text
 
-def generate_with_retry(model, inputs, retries=3):
-    for i in range(retries):
-        try: return model.generate_content(inputs)
-        except Exception as e:
-            if i == retries - 1: raise e
-            time.sleep(1)
+def run_coder_and_debugger(plan, template, model_name):
+    """Step 2 & 3: Generates Code from Plan and Debugs it"""
+    model = genai.GenerativeModel(model_name)
+    
+    # STEP 2: THE CODER (Implementation)
+    with st.status("💻 Coder: Translating plan to Python...", expanded=False) as status:
+        coder_prompt = f"""
+        Using this Math Plan: {plan}
+        And this Golden Template Style: {template}
+        
+        Write the complete Python code. 
+        - Use * for scalars, @ for matrices.
+        - Use cp.bmat for the LMI.
+        - Ensure numerical stability: Add small epsilon (1e-6) to constraints if needed (e.g. nu >= 1e-6).
+        - CRITICAL: Use raw strings (r"...") for ALL Matplotlib text containing backslashes or LaTeX. 
+          Correct: plt.xlabel(r"Value of $\\rho$")
+          Wrong: plt.xlabel("Value of $\\rho$")
+        - Solver Robustness: Use a loop [cp.CLARABEL, cp.SCS, cp.ECOS] to handle "inaccurate solution" warnings.
+        Return ONLY the code block.
+        """
+        code_resp = model.generate_content(coder_prompt)
+        raw_code = extract_code(code_resp.text)
+        status.update(label="💻 Coder: Draft complete!", state="complete")
+
+    # STEP 3: THE DEBUGGER (Verification)
+    with st.status("🕵️ Debugger: Pre-flight Syntax Check...", expanded=True) as status:
+        debugger_prompt = f"""
+        Review this generated code for errors:
+        {raw_code}
+        
+        Check for:
+        1. Invalid syntax like `<<=` (must be `<< 0`).
+        2. Dimension mismatches in `cp.bmat`.
+        3. Incorrect operator use (using `@` with a scalar).
+        4. STRING SAFETY: Ensure all plot titles/labels using LaTeX (e.g. $\\gamma$) use `r"..."` strings.
+           - Bad: plt.title("$\\gamma$")
+           - Good: plt.title(r"$\\gamma$")
+        
+        If errors exist, return the FULL FIXED code. If it is perfect, return the original code.
+        """
+        final_resp = model.generate_content(debugger_prompt)
+        final_code = extract_code(final_resp.text)
+        
+        if final_code:
+            status.update(label="🕵️ Debugger: Code verified and fixed!", state="complete")
+            return final_code
+        else:
+            status.update(label="🕵️ Debugger: Original code was perfect.", state="complete")
+            return raw_code
 
 def run_code_backend(code):
-    # HEALTH CHECK: Print versions to debug log
-    try: 
-        import cvxpy
-        import numpy
-        # This print will show up in the "Output" tab of the app
-        print(f"DEBUG: Running on Python {sys.version.split()[0]}")
-        print(f"DEBUG: CVXPY Version: {cvxpy.__version__}")
-        print(f"DEBUG: NumPy Version: {numpy.__version__}")
-    except ImportError as e: 
-        return "", f"Missing library {e.name}. Install it.", []
-
-    is_safe, msg = validate_code_safety(code)
-    if not is_safe: return "", msg, []
-
-    patched_code = "import matplotlib\nmatplotlib.use('Agg')\n" + code
+    patch_header = "import matplotlib\nmatplotlib.use('Agg')\nimport matplotlib.pyplot as plt\nimport uuid\ndef mock_show(*args,**kwargs):\n  plt.savefig(f'plot_{uuid.uuid4().hex[:6]}.png')\n  plt.close()\nplt.show = mock_show\n"
+    patched_code = patch_header + code
     try:
-        # INCREASED TIMEOUT: Servers are slower than local machines
         proc = subprocess.run([sys.executable, "-c", patched_code], capture_output=True, text=True, timeout=60)
-    except subprocess.TimeoutExpired:
-        return "", "Error: Timeout (60s). The server is too slow or infinite loop.", []
-
+    except: return "", "Execution Timeout", []
+    
     plots = []
     for f in glob.glob("*.png"):
-        try:
-            with open(f, "rb") as img: plots.append(img.read())
-            # os.remove(f) # Keep files momentarily for PDF generation if needed
-        except: pass
+        with open(f, "rb") as img: plots.append(img.read())
+        os.remove(f)
     return proc.stdout, proc.stderr, plots
 
-def fix_code_ai(bad_code, error, model_name, problem_desc):
-    model = genai.GenerativeModel(model_name)
-    # RAG: Inject learned rules into fix prompt at the END for recency bias
-    kb_text = ""
-    if st.session_state.knowledge_base:
-        kb_text = "CRITICAL USER RULES (YOU MUST APPLY THESE):\n" + "\n".join([f"- {r}" for r in st.session_state.knowledge_base])
-    
-    prompt = f"""
-    You are an expert Python debugger. Fix the error in the code below.
-    
-    PROBLEM DESCRIPTION (SOURCE OF TRUTH - DO NOT CHANGE MATRICES):
-    {problem_desc}
-    
-    ERROR: {error}
-    
-    BROKEN CODE:
-    {bad_code}
-    
-    INSTRUCTIONS:
-    1. Fix the syntax/logic error.
-    2. Do NOT change matrix values from the description.
-    3. IMPORTANT: Use `cp.bmat` for Block Matrices. Do NOT use `cp.hstack` or `vstack` explicitly inside the script, let bmat handle it.
-    4. RESHAPE SCALARS: Before putting a scalar (like gamma, nu) into `cp.bmat`, reshape it: `gamma_block = cp.reshape(gamma, (1, 1))`.
-    5. Ensure all blocks in a bmat row have the EXACT SAME HEIGHT. Reshape if necessary.
-    6. Ensure solvers are called in a try-except loop (CLARABEL, SCS, ECOS).
-    7. Use raw strings (r"...") for comments containing backslashes to avoid SyntaxWarnings.
-    8. Use order='F' for cp.flatten and cp.reshape to silence warnings.
-    
-    {kb_text}
-    
-    Return ONLY the complete fixed code.
-    """
-    resp = generate_with_retry(model, prompt)
-    return extract_code(resp.text)
+# --- 4. MAIN INTERFACE ---
 
-def learn_from_fix(original_error, fixed_code, model_name):
-    model = genai.GenerativeModel(model_name)
-    prompt = f"""
-    Analyze this error and the fix provided.
-    
-    Error: "{original_error}"
-    
-    Fixed Code Snippet:
-    {fixed_code}
-    
-    TASK: Extract ONE specific, technical rule to prevent this exact mistake in the future.
-    Bad Rule: "Fix dimensions."
-    Good Rule: "Always use cp.Variable((n,1)) for vectors instead of (n,)."
-    Good Rule: "Use * for scalar multiplication, not @."
-    """
-    resp = generate_with_retry(model, prompt)
-    return resp.text.strip()
-
-def validate_problem_logic(text, model_name):
-    model = genai.GenerativeModel(model_name)
-    prompt = f"""
-    Act as a Math Logic Validator. Analyze the following problem description.
-    Check for:
-    1. Dimension mismatches (e.g. Matrix A is 2x2 but b is 3x1).
-    2. Missing variables (e.g. used 'rho' but never defined it).
-    3. Logical inconsistencies.
-    
-    PROBLEM:
-    {text}
-    
-    Output Format:
-    - If valid: "VALID"
-    - If issues found: List them as bullet points. Suggest resolutions.
-    """
-    resp = generate_with_retry(model, prompt)
-    return resp.text
-
-def create_word_report(problem, code, output, plots, knowledge_base=None):
-    if Document is None:
-        return None
-        
-    doc = Document()
-    doc.add_heading('Experiment Report', 0)
-    
-    # 1. Problem
-    doc.add_heading('1. Problem Description', level=1)
-    doc.add_paragraph(problem)
-    
-    # 2. Code
-    doc.add_heading('2. Python Code', level=1)
-    doc.add_paragraph(code, style='Quote')
-    
-    # 3. Output
-    doc.add_heading('3. Execution Output', level=1)
-    out_text = output['out'] or "[No Standard Output]"
-    doc.add_paragraph(out_text, style='Quote')
-
-    # 4. Errors (Explicit section)
-    if output['err']:
-        doc.add_heading('4. Errors Detected', level=1)
-        doc.add_paragraph(output['err'], style='Quote')
-
-    # 5. Learned Rules (Knowledge Base)
-    if knowledge_base:
-        doc.add_heading('5. Learned Rules (Knowledge Base)', level=1)
-        if not knowledge_base:
-             doc.add_paragraph("No specific rules learned for this case yet.")
-        else:
-            for rule in knowledge_base:
-                doc.add_paragraph(rule, style='List Bullet')
-    
-    # 6. Plots
-    if plots:
-        doc.add_heading('6. Generated Plots', level=1)
-        for i, plot_bytes in enumerate(plots):
-            # Save temp file for FPDF
-            temp_name = f"temp_plot_{i}.png"
-            with open(temp_name, "wb") as f:
-                f.write(plot_bytes)
-            doc.add_picture(temp_name, width=Inches(6))
-            os.remove(temp_name)
-            
-    # Save to memory stream
-    doc_io = io.BytesIO()
-    doc.save(doc_io)
-    doc_io.seek(0)
-    return doc_io
-
-# --- 5. MAIN LOGIC ---
-
-if st.session_state.current_case_name:
-    st.info(f"📂 Active Case: **{st.session_state.current_case_name}**")
-
-# Step A: Processing
 if uploaded_file and ("last_file" not in st.session_state or st.session_state.last_file != uploaded_file.name):
     st.session_state.last_file = uploaded_file.name
-    with st.spinner("Processing PDF images..."):
-        try:
-            doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
-            st.session_state.pdf_images = [Image.open(io.BytesIO(page.get_pixmap(dpi=150).tobytes("png"))) for page in doc]
-            st.session_state.messages = [{"role": "assistant", "content": f"✅ Uploaded! {len(st.session_state.pdf_images)} pages ready."}]
-            st.session_state.extracted_text = ""
-            st.session_state.show_review = False
-            st.session_state.active_code = ""
-        except Exception as e: st.error(f"Error reading PDF: {e}")
+    doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
+    st.session_state.pdf_images = [Image.open(io.BytesIO(page.get_pixmap(dpi=150).tobytes("png"))) for page in doc]
+    st.session_state.show_review = False
     st.rerun()
 
-# Step B: Workflow
-if (uploaded_file or st.session_state.show_review) and selected_model_name:
+# --- 3. SESSION STATE INIT (Consolidated) ---
+if "extracted_text" not in st.session_state: st.session_state.extracted_text = ""
+if "architect_plan" not in st.session_state: st.session_state.architect_plan = ""
+if "active_code" not in st.session_state: st.session_state.active_code = ""
+if "run_output" not in st.session_state: st.session_state.run_output = None
+if "show_review" not in st.session_state: st.session_state.show_review = False
+
+t1, t2 = st.tabs(["📄 Step 1: Extraction & Theory", "🚀 Step 2: Agentic Workbench"])
+
+# --- DEMO PROBLEM (Source of Truth) ---
+DEFAULT_PROBLEM_DESCRIPTION = """
+**Optimization Problem:**
+Minimize scalar nu > 0 subject to LMI constraint.
+
+Dimensions: n=2, m=2, l=2.
+Matrices:
+A = [[1, 3], [2, 6]]
+b = [[5], [10]]
+F = [[1, 0], [0, 1]]
+E_A = [[0, 1], [0, 0]]
+E_b = [[0], [1]]
+D = 0 (2x2 zero matrix)
+
+M is a square matrix (l x l):
+M = p * I (2x2)
+
+LMI Block Matrix (4x4 blocks):
+Row 1: [-I, F*lam, A*x-b, 0]
+Row 2: [lam*F.T, -lam*I, 0, lam*D.T*M.T]
+Row 3: [(A*x-b).T, 0, -nu, (E_A*x-E_b).T*M.T]
+Row 4: [0, M*D*lam, M*(E_A*x-E_b), -lam*I]
+
+Tasks:
+1. Plot gamma = sqrt(nu) vs p in [0, 2] step 0.1 for two cases:
+   - Curve 1: Optimize over {x, lam, nu}
+   - Curve 2: Optimize over {lam, nu} with fixed x=[-1, 2].T
+2. Plot x1 vs x2 trajectory for Curve 1.
+3. For each p, calculate perturbation Omega* and new LMI feasibility (nu_new).
+   - Omega* = (v_x0 @ (E_A@x - E_b + D@v_x0).T) / norm(...)**2
+   - v_x0 = inv(inv(lam*I) - F.T@F) @ F.T @ (A@x - b)
+   - A* = A + F@Omega*...
+   - Check new LMI: [[-I, A*x - b*], [..., -nu_new]] <= 0
+4. Print table comparing nu_old vs nu_new and values of Omega*.
+"""
+
+if not st.session_state.extracted_text:
+    st.session_state.extracted_text = DEFAULT_PROBLEM_DESCRIPTION
+
+with t1:
+    if st.session_state.get("pdf_images"):
+        if st.button("🔍 Extract Problem Verbatim", type="primary"):
+            model = genai.GenerativeModel(selected_model_name)
+            resp = model.generate_content(["Extract all matrices and the LMI formula exactly as they appear."] + st.session_state.pdf_images)
+            st.session_state.extracted_text = resp.text
+            st.session_state.show_review = True
+            st.rerun()
     
-    # 1. ANALYZE (Raw Extraction)
-    if uploaded_file and not st.session_state.show_review:
-        st.info("Step 1: Extract text and formulas.")
-        if st.button("🔍 Analyze & Extract Text", type="primary"):
-            with st.spinner(f"Analyzing with {selected_model_name}..."):
-                try:
-                    model = genai.GenerativeModel(selected_model_name)
-                    # VERBATIM PROMPT
-                    inputs = ["Extract the problem statement VERBATIM from these images. Correct obvious OCR typos (e.g. 'O' vs '0', 'l' vs '1') but keep matrix values strictly as written. Do not generate code yet."] + st.session_state.pdf_images
-                    response = generate_with_retry(model, inputs)
-                    st.session_state.extracted_text = response.text
-                    st.session_state.show_review = True
-                    st.rerun()
-                except Exception as e: st.error(f"Analysis failed: {e}")
-
-    # 2. REVIEW & VALIDATE & GENERATE
-    if st.session_state.show_review:
-        st.success("Step 1 Complete. Review extracted text below.")
-        
-        # Live Editing
-        live_problem_description = st.text_area("📝 Problem Description (Source of Truth):", key="extracted_text", height=300)
-        
-        col_val, col_gen = st.columns([1, 1])
-        
-        # VALIDATION FEATURE
-        with col_val:
-            if st.button("🕵️ Validate Problem Statement"):
-                with st.spinner("Checking logic and dimensions..."):
-                    val_report = validate_problem_logic(live_problem_description, selected_model_name)
-                    st.session_state.validation_result = val_report
-        
-        if st.session_state.validation_result:
-            if "VALID" in st.session_state.validation_result:
-                st.success("✅ Logic Check Passed")
-            else:
-                st.warning("⚠️ Potential Issues Found:")
-                st.write(st.session_state.validation_result)
-
-        with col_gen:
-            if st.button("🚀 Generate Python Code (Step 2)", type="primary"):
-                with st.spinner("Generating Code..."):
-                    try:
-                        model = genai.GenerativeModel(selected_model_name)
-                        
-                        # RAG: Inject Knowledge Base
-                        kb_str = ""
-                        if st.session_state.knowledge_base:
-                            kb_str = "CRITICAL USER OVERRIDES (YOU MUST FOLLOW THESE RULES):\n" + "\n".join([f"- {r}" for r in st.session_state.knowledge_base])
-                            st.toast(f"Applying {len(st.session_state.knowledge_base)} user rules...")
-
-                        # SANITIZED & DEFENSIVE TEMPLATE
-                        CVXPY_TEMPLATE = """
-                        import cvxpy as cp
-                        import numpy as np
-                        import matplotlib.pyplot as plt
-                        
-                        # 1. INPUT DATA (Load from description ONLY)
-                        # n = ...
-                        
-                        # DEFENSIVE: Explicitly reshape inputs to avoid broadcasting errors
-                        # Use dtype=float to prevent integer math issues
-                        # A = np.array(..., dtype=float).reshape(n, n)
-                        # b = np.array(..., dtype=float).reshape(n, 1) # Force column vector
-                        
-                        # 2. VARIABLES
-                        # x = cp.Variable((n, 1)) # Explicit column vector
-                        
-                        # 3. CONSTRAINTS (Using cp.bmat is safer than hstack/vstack)
-                        # Reshape scalars for bmat
-                        nu = cp.Variable()
-                        nu_block = cp.reshape(nu, (1, 1))
-                        
-                        # Example 2x2 block LMI
-                        # Row 1: [M, A@x - b]
-                        # Row 2: [(A@x - b).T, -nu_block]
-                        # LMI = cp.bmat([
-                        #     [M, A @ x - b],
-                        #     [(A @ x - b).T, -nu_block]
-                        # ])
-                        # constraints = [LMI << 0]
-                        
-                        # 4. SOLVE (Robust Fallback)
-                        prob = cp.Problem(cp.Minimize(0), constraints)
-                        
-                        # Try multiple solvers in case one fails on the platform
-                        solved = False
-                        for solver in [cp.CLARABEL, cp.SCS, cp.ECOS]:
-                            try:
-                                prob.solve(solver=solver)
-                                if prob.status in ["optimal", "optimal_inaccurate"]:
-                                    solved = True
-                                    break
-                            except:
-                                continue
-                        
-                        if not solved:
-                            print("Warning: All solvers failed or problem is infeasible.")
-                        """
-
-                        prompt = f"""
-                        You are an expert Control Theory coder. Write a Python script to solve the problem described.
-                        
-                        REFERENCE TEMPLATE:
-                        {CVXPY_TEMPLATE}
-
-                        DESCRIPTION (SOURCE OF TRUTH):
-                        {live_problem_description}
-                        
-                        CRITICAL RULES:
-                        1. Use `cp.bmat` for LMIs. Do NOT use `cp.hstack` or `vstack` manually for block matrices (it causes dimension errors).
-                        2. Reshape ALL scalars (like gamma/nu/rho) to (1, 1) before putting them in a matrix. Example: `gamma_block = cp.reshape(gamma, (1, 1), order='F')`
-                        3. Reshape ALL vectors to (n, 1) or (1, n). Never use flat (n,) arrays.
-                        4. Use raw strings (r"...") for any text with backslashes (like LaTeX comments).
-                        5. Use a SOLVER LOOP (CLARABEL, SCS, ECOS) to ensure robustness.
-                        6. Data Integrity: Use the exact matrices from the description.
-                        7. Use `cp.flatten(..., order='F')` if using flatten.
-                        8. Verify Block Heights: In `cp.bmat`, all blocks in the same row list must have the exact same height.
-                           
-                        {kb_str}
-                        """
-                        response = generate_with_retry(model, prompt)
-                        found_code = extract_code(response.text)
-                        if found_code:
-                            st.session_state.active_code = found_code
-                            st.session_state.run_output = None
-                        else: st.warning("No code found.")
-                        st.rerun()
-                    except Exception as e: st.error(f"Generation failed: {e}")
-
-# Step D: Workbench
-if st.session_state.active_code:
-    st.divider()
-    st.header("🛠️ Workbench")
-    edited_code = st.text_area("Python Code", value=st.session_state.active_code, height=350)
-    st.session_state.active_code = edited_code
+    problem_desc = st.text_area("Source of Truth:", value=st.session_state.get("extracted_text", ""), height=300)
+    st.session_state.extracted_text = problem_desc
     
-    col1, col2 = st.columns([1, 4])
-    with col1:
-        if st.button("▶️ Run Code"):
-            with st.spinner("Running..."):
-                out, err, plots = run_code_backend(edited_code)
-                st.session_state.run_output = {"out": out, "err": err, "plots": plots}
+    SETTINGS_FILE = "settings.json"
+    saved_template = ""
+    if os.path.exists(SETTINGS_FILE):
+        with open(SETTINGS_FILE, "r") as f: saved_template = json.load(f).get("golden_code", "")
     
-    # RESULTS: Displayed regardless of success/failure so Download button is always visible
-    if st.session_state.run_output:
-        res = st.session_state.run_output
-        t1, t2, t3 = st.tabs(["Plots", "Output", "Errors"])
-        with t1:
-            if res['plots']:
-                for p in res['plots']: st.image(p)
-            else:
-                st.info("No plots generated yet.")
-        with t2:
-            st.code(res['out'] if res['out'] else "No text output.")
-        with t3:
-            if res['err']:
-                st.error(res['err'])
-                
-                if st.button("🚑 Auto-Fix & Learn"):
-                    with st.spinner("Fixing and Learning..."):
-                        # 1. Get the fixed code (passing description to ensure no invention)
-                        fixed_code = fix_code_ai(
-                            edited_code, 
-                            res['err'], 
-                            selected_model_name,
-                            st.session_state.extracted_text # Pass source truth
-                        )
-                        
-                        if fixed_code:
-                            # 2. Extract rule by comparing broken vs fixed
-                            new_rule = learn_from_fix(res['err'], fixed_code, selected_model_name)
-                            
-                            # 3. Save rule
-                            if new_rule:
-                                st.session_state.knowledge_base.append(new_rule)
-                                # Save to disk automatically
-                                with open("knowledge_base.json", "w") as f:
-                                    json.dump(st.session_state.knowledge_base, f)
-                                st.toast(f"Learned: {new_rule}")
-                            
-                            # 4. Update code
-                            st.session_state.active_code = fixed_code
-                            st.session_state.run_output = None
-                            st.rerun()
-                        else:
-                            st.error("AI could not fix the code.")
-            else:
-                st.success("No errors detected.")
+    with st.expander("⭐ Edit Master Golden Template"):
+        template = st.text_area("Code Style Reference:", value=saved_template, height=250)
+        if st.button("💾 Save Template"):
+            with open(SETTINGS_FILE, "w") as f: json.dump({"golden_code": template}, f)
+
+with t2:
+    st.info("Step 1: The Architect analyzes the math. You review it. Step 2: The Coder writes the script.")
+    
+    if st.button("1️⃣ Run Architect (Generate Plan)", type="primary"):
+        if selected_model_name and problem_desc:
+            plan = run_architect_agent(problem_desc, selected_model_name)
+            st.session_state.architect_plan = plan
+            st.rerun()
+
+    # Only show Coder step if a plan exists
+    if st.session_state.architect_plan:
+        st.subheader("📐 Architect's Plan (Editable)")
+        # Display editable text area linked to session state
+        edited_plan = st.text_area("Review dimensions and logic before coding:", 
+                                   value=st.session_state.architect_plan, 
+                                   height=300, 
+                                   key="architect_plan_input")
         
-        # Word Report Button - ALWAYS VISIBLE AT BOTTOM
+        # Sync edits back to session state if changed
+        if edited_plan != st.session_state.architect_plan:
+            st.session_state.architect_plan = edited_plan
+
+        if st.button("2️⃣ Run Coder (Generate Code)", type="primary"):
+            st.session_state.active_code = run_coder_and_debugger(edited_plan, template, selected_model_name)
+            st.rerun()
+
+    if st.session_state.get("active_code"):
         st.divider()
-        if st.button("📄 Download Word Report (.docx)"):
-            if Document is not None:
-                try:
-                    word_bytes = create_word_report(
-                        st.session_state.extracted_text,
-                        edited_code,
-                        res,
-                        res['plots'],
-                        st.session_state.knowledge_base
-                    )
-                    st.download_button(
-                        label="Click to Download DOCX",
-                        data=word_bytes,
-                        file_name=f"{st.session_state.current_case_name or 'report'}.docx",
-                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                    )
-                except Exception as e:
-                    st.error(f"Report Generation Error: {e}")
-            else:
-                st.error("Missing 'python-docx' library. Please update requirements.txt.")
+        st.subheader("🐍 Generated Code")
+        code_input = st.text_area("Final Verified Code:", value=st.session_state.active_code, height=400)
+        st.session_state.active_code = code_input
+
+        if st.button("▶️ Run Experiment"):
+            with st.spinner("Executing Python..."):
+                out, err, plots = run_code_backend(code_input)
+                st.session_state.run_output = {"out": out, "err": err, "plots": plots}
+        
+        if st.session_state.get("run_output"):
+            res = st.session_state.run_output
+            if res['err']: st.error(res['err'])
+            if res['out']: st.info(res['out'])
+            for p in res['plots']: st.image(p)
+
+            col1, col2 = st.columns([1, 1])
+            with col1:
+                if Document and st.button("📄 Save to Word Report"):
+                    doc = Document()
+                    doc.add_heading("PhD Experiment Results", 0)
+                    doc.add_heading("Architect Plan", level=1); doc.add_paragraph(st.session_state.architect_plan)
+                    doc.add_heading("Generated Code", level=1); doc.add_paragraph(code_input)
+                    doc.add_heading("Solver Logs", level=1); doc.add_paragraph(res['out'])
+                    for i, p_bytes in enumerate(res['plots']):
+                        p_path = f"tmp_{i}.png"
+                        with open(p_path, "wb") as f: f.write(p_bytes)
+                        doc.add_picture(p_path, width=Inches(5))
+                        os.remove(p_path)
+                    doc_io = io.BytesIO(); doc.save(doc_io); doc_io.seek(0)
+                    st.download_button("📥 Download Report", doc_io, "report.docx")
+            
+            with col2:
+                if st.button("💾 Save Results to History"):
+                    if st.session_state.current_case_name:
+                        st.session_state.history[st.session_state.current_case_name] = {
+                            "extracted_text": st.session_state.get("extracted_text", ""),
+                            "architect_plan": st.session_state.get("architect_plan", ""),
+                            "active_code": st.session_state.get("active_code", ""),
+                            "run_output": serialize_run_output(st.session_state.get("run_output", None))
+                        }
+                        with open(HISTORY_FILE, "w") as f: json.dump(st.session_state.history, f)
+                        st.toast(f"Saved results to '{st.session_state.current_case_name}'!")
+                    else:
+                        st.error("Please create or load a case in the sidebar first.")
