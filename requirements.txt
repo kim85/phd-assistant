@@ -2,8 +2,9 @@ streamlit
 pymupdf
 google-generativeai
 Pillow
-cvxpy>=1.6.0
-numpy
-matplotlib
-scipy
 python-docx
+numpy>=1.26.0
+matplotlib
+cvxpy>=1.5.0
+scipy
+clarabel
