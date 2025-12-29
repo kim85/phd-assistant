@@ -1,128 +1,77 @@
 import streamlit as st
 import fitz  # PyMuPDF
 import google.generativeai as genai
-from PIL import Image
-import io
-import re
+import numpy as np
+import cvxpy as cp
+import matplotlib.pyplot as plt
 import subprocess
 import sys
-import glob
+import re
 import os
-import json
-import numpy as np
+import glob
 
 # --- 1. CONFIGURATION ---
-st.set_page_config(page_title="PhD Assistant: LMI Specialist", layout="wide")
-st.title("PhD Assistant: Sledgehammer LMI Agent 🧪")
+st.set_page_config(page_title="LMI Solver (Stable Edition)", layout="wide")
+st.title("🧪 PhD LMI Solver: Stable Legacy Version")
 
 with st.sidebar:
-    st.header("⚙️ Configuration")
-    api_key = st.text_input("Enter Google API Key", type="password")
+    st.header("⚙️ Settings")
+    api_key = st.text_input("Gemini API Key", type="password")
     if api_key:
         genai.configure(api_key=api_key)
-        try:
-            models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-            selected_model = st.selectbox("Select Model", models, index=0)
-        except: st.error("Invalid API Key")
+        models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+        selected_model = st.selectbox("Model", models, index=0)
 
-# --- 2. AGENTIC FUNCTIONS ---
+# --- 2. CLASSIC PROMPT ---
+# This prompt is designed for CVXPY 1.4.x which is more flexible with shapes.
+LEGACY_PROMPT = """
+Write a Python 3.11 script using CVXPY 1.4.3.
+System: {problem_text}
 
-def extract_code(text):
-    match = re.search(r"```(python|py)?\n(.*?)```", text, re.DOTALL)
-    if match:
-        code = match.group(2).strip()
-        return code.replace("<<=", "<<").replace(">>=", ">>")
-    return None
+STRICT ARCHITECTURE:
+1. Define matrices A, b, F, EA, Eb using np.array.
+2. Loop p in np.arange(0, 2.1, 0.1).
+3. Inside loop:
+   - Define x = cp.Variable((2,1)), nu = cp.Variable(nonneg=True).
+   - Fix lam = 1.0 (to avoid DCP Variable*Variable error).
+   - Use cp.bmat([[...], [...]]) for the 4x4 LMI.
+   - Task 2: Calculate v_x0 and Omega* in NumPy using results from Task 1.
+   - Solve a second 2x2 LMI for nu_task2.
+4. Output: print(p, nu_task1, nu_task2) and plot Gamma vs p.
+"""
 
-def run_architect_agent(problem, model_name):
-    model = genai.GenerativeModel(model_name)
-    prompt = f"""
-    Analyze this LMI problem: {problem}
-    TASK: Create a JSON 'Dimension Ledger'. 
-    RETURN ONLY JSON.
-    Example:
-    {{
-      "dimensions": {{"n": 2, "m": 2, "l": 2}},
-      "ledger": {{
-          "Row1_Height": "n", "Row2_Height": "m", "Row3_Height": 1, "Row4_Height": "l",
-          "Col1_Width": "n", "Col2_Width": "m", "Col3_Width": 1, "Col4_Width": "l"
-      }},
-      "variables": {{"x": "n x 1", "Lambda": "scalar", "nu": "scalar"}}
-    }}
-    """
-    response = model.generate_content(prompt)
-    json_match = re.search(r"\{.*\}", response.text, re.DOTALL)
-    return json_match.group(0) if json_match else response.text
-
-def run_coder_agent(ledger_json, model_name):
-    model = genai.GenerativeModel(model_name)
-    prompt = f"""
-    Using this JSON Ledger: {ledger_json}
-    
-    TASK: Generate a full Python script to solve the LMI over p in [0, 2] with step 0.1.
-    
-    STRICT RULES:
-    1. Loop through p = np.arange(0, 2.1, 0.1).
-    2. Define x = cp.Variable((n, 1)), lam = 1.0 (fixed for DCP), nu = cp.Variable(nonneg=True).
-    3. Use cp.bmat([]) to construct the 4x4 LMI.
-    4. SLEDGEHAMMER RULE: Wrap EVERY block in cp.reshape(block, (h, w), order='C').
-    5. TASK 2: After solving Task 1, calculate v_x0 and Omega* using NumPy. 
-    6. Formulate A* and b* and solve a second LMI for nu_new.
-    7. Generate 2 plots: (1) Gamma vs p for Curve 1 and 2, (2) Trajectory of optimal x.
-    8. Print a table comparing nu from Task 1 and Task 2.
-    """
-    return extract_code(model.generate_content(prompt).text)
-
-def run_code_backend(code):
-    patch = "import matplotlib\nmatplotlib.use('Agg')\nimport matplotlib.pyplot as plt\nimport uuid\ndef mock_show():\n  plt.savefig(f'r_{uuid.uuid4().hex[:5]}.png')\n  plt.close()\nplt.show = mock_show\n"
+# --- 3. RUNTIME ENGINE ---
+def run_classic_sandbox(code):
+    patch = "import matplotlib\nmatplotlib.use('Agg')\nimport matplotlib.pyplot as plt\nimport uuid\ndef mock_show():\n  plt.savefig(f'plot_{uuid.uuid4().hex[:5]}.png')\n  plt.close()\nplt.show = mock_show\n"
     try:
         proc = subprocess.run([sys.executable, "-c", patch + code], capture_output=True, text=True, timeout=90)
         plots = []
-        for f in glob.glob("r_*.png"):
+        for f in glob.glob("plot_*.png"):
             with open(f, "rb") as img: plots.append(img.read())
             os.remove(f)
         return proc.stdout, proc.stderr, plots
     except Exception as e:
         return "", str(e), []
 
-# --- 3. UI LAYOUT ---
+# --- 4. UI ---
+st.subheader("1. Problem Description")
+user_input = st.text_area("Paste LMI matrices and Task 1/2 requirements:", height=200)
 
-if "architect_plan" not in st.session_state: st.session_state.architect_plan = ""
-if "active_code" not in st.session_state: st.session_state.active_code = ""
-
-tab1, tab2 = st.tabs(["📐 Phase 1: Planning", "🚀 Phase 2: Execution"])
-
-with tab1:
-    col_left, col_right = st.columns(2)
-    with col_left:
-        st.subheader("Source Analysis")
-        uploaded_file = st.file_uploader("Upload Problem PDF", type="pdf")
-        if uploaded_file and st.button("🔍 Extract Verbatim"):
-            doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
-            imgs = [Image.open(io.BytesIO(p.get_pixmap(dpi=150).tobytes("png"))) for p in doc]
-            m = genai.GenerativeModel(selected_model)
-            st.session_state.extracted_text = m.generate_content(["Extract LMI matrices exactly."] + imgs).text
-        
-        prob_desc = st.text_area("Problem Metadata", value=st.session_state.get("extracted_text", ""), height=300)
-
-    with col_right:
-        st.subheader("📋 The Ledger")
-        if st.button("🏗️ Build Dimension Ledger"):
-            st.session_state.architect_plan = run_architect_agent(prob_desc, selected_model)
-        
-        plan_input = st.text_area("JSON Ledger", value=st.session_state.architect_plan, height=300)
-
-with tab2:
-    if st.button("🚀 Generate & Run Experiment", type="primary"):
-        with st.spinner("Writing Sledgehammer Code..."):
-            st.session_state.active_code = run_coder_agent(plan_input, selected_model)
-        
-        with st.spinner("Solving LMIs & Generating Plots..."):
-            out, err, plots = run_code_backend(st.session_state.active_code)
+if st.button("🚀 Run Stable Solver", type="primary"):
+    if not api_key:
+        st.error("Missing API Key")
+    else:
+        model = genai.GenerativeModel(selected_model)
+        with st.spinner("Generating stable code..."):
+            response = model.generate_content(LEGACY_PROMPT.format(problem_text=user_input))
+            code_match = re.search(r"```python\n(.*?)```", response.text, re.DOTALL)
+            code = code_match.group(1) if code_match else response.text
             
+        with st.spinner("Executing Solver..."):
+            out, err, plots = run_classic_sandbox(code)
             if err: st.error(err)
             if out: st.code(out)
             for p in plots: st.image(p)
-
-    st.subheader("Generated Python Script")
-    st.code(st.session_state.active_code, language="python")
+            
+        with st.expander("📂 View Script"):
+            st.code(code)
